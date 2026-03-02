@@ -1,6 +1,8 @@
 # AVBD Solver - Development Notes
 
-> **Update (2026-02-14)**: Lambda warm-starting has been implemented. See §1.6 for implementation details.
+> **Update (2026-03-02)**: Prismatic Hessian path is integrated and standalone semantics are aligned with PhysX. Revolute is integrated in solver code path, but completion is pending SnippetJoint visual validation.
+
+Status Legend: `Integrated` = merged into main code path; `Accepted` = integrated and validated by acceptance checks; `Pending` = not complete or acceptance gate not closed.
 
 ## Why AVBD
 
@@ -17,14 +19,14 @@ AVBD (Augmented Variable Block Descent) was introduced into PhysX for the follow
 ### Roadmap
 
 ```
-Contact AL stability (DONE)         Joint AL fix (NEXT)
-  All non-joint objects stable    →    Ultimate hand works
-  AVBD usable as sole solver           High mass-ratio joints stable
-            ↓                                    ↓
-  Lambda warm-starting (DONE)          Cloth / soft body / GPU
-  Reduce iterations → perf             Unified solver architecture
-            ↓                                    ↓
-              Multiplayer determinism across all the above
+Contact AL stability (DONE)           Joint Hessian integration (IN PROGRESS)
+  All non-joint objects stable      →   Spherical/Fixed/D6/Gear/Prismatic integrated
+  AVBD usable as sole solver             Revolute integrated, acceptance pending
+            ↓                                      ↓
+  Lambda warm-starting (DONE)            Cloth / soft body / articulation
+  Reduce iterations → perf               Unified solver architecture
+            ↓                                      ↓
+                Multiplayer determinism across all the above
 ```
 
 ## Current Configuration (Defaults)
@@ -42,13 +44,26 @@ Contact AL stability (DONE)         Joint AL fix (NEXT)
 
 **Default path**: 3x3 decoupled local solve (`enableLocal6x6Solve = false`).
 
+**Important runtime policy**: bodies touching **Prismatic** are forced to local 6x6 solve, even when global 3x3 mode is enabled.
+
 **Recommended for stability** (stacking/joints): `outerIterations=4`, `innerIterations=8`.
 
 ## Known Issues
 
+### 0. Revolute acceptance is not closed yet
+
+**Status**: Pending
+
+**Description**: Revolute rows are integrated in the local Hessian and dual update path, but SnippetJoint visual validation and full acceptance checklist are not yet closed.
+
+**Acceptance gate**:
+- SnippetJoint visual behavior matches expected hinge constraints in representative scenes.
+- No regression in mixed-joint chains (revolute + prismatic + fixed).
+- Stable dual/limit behavior under limit crossing and motor-enabled cases.
+
 ### 1. Low iteration count (1x4) does not achieve stable stacking
 
-**Status**: Open
+**Status**: Pending
 
 **Description**: The AVBD paper recommends outerIterations=1, innerIterations=4 as sufficient for stable simulation. However, the current implementation requires outerIterations=4, innerIterations=8 (32 total inner iterations) to achieve stable box stacking. With 1x4 (4 total), stacked boxes slowly sink or collapse.
 
@@ -64,7 +79,7 @@ Contact AL stability (DONE)         Joint AL fix (NEXT)
 
 ### 2. Lambda warm-starting implementation details ✅
 
-**Status**: Implemented
+**Status**: Accepted
 
 **Description**: Lambda warm-starting has been fully implemented in [`DyAvbdDynamics.cpp`](physx/source/lowleveldynamics/src/DyAvbdDynamics.cpp:338-406).
 
@@ -153,3 +168,13 @@ Contact AL stability (DONE)         Joint AL fix (NEXT)
 **Impact**: Significantly improves convergence speed, especially for persistent contact scenarios.
 
 **Known limitation**: The decay factors (`wsAlpha=0.95`, `wsGamma=0.99`) may need tuning to achieve paper-recommended 1×4 iteration stability.
+
+### 3. Documentation and implementation can drift without parity gates
+
+**Status**: Pending
+
+**Description**: The project now contains both integrated and acceptance-pending items. Without explicit parity/acceptance gates, documentation can overstate completion.
+
+**Mitigation**:
+- Keep three explicit statuses in docs: `integrated`, `accepted`, `pending`.
+- Require PhysX↔standalone parity checks for all newly integrated joint semantics.

@@ -57,6 +57,15 @@ static physx::PxU64 gAvbdMotorFrameCounter = 0;
 // Accessor for the solver to get current frame
 physx::PxU64 getAvbdMotorFrameCounter() { return gAvbdMotorFrameCounter; }
 
+#ifndef AVBD_JOINT_DEBUG
+#define AVBD_JOINT_DEBUG 0
+#endif
+#ifndef AVBD_JOINT_DEBUG_FRAMES
+#define AVBD_JOINT_DEBUG_FRAMES 2
+#endif
+
+static constexpr physx::PxU16 AVBD_PRISMATIC_LIMIT_ENABLED_FLAG = 0x0002;
+
 // Helper struct for joint data protocol (must match SnippetAvbdDx11)
 struct AvbdSnippetJointData {
   enum Type { eSPHERICAL = 0, eFIXED, eREVOLUTE, ePRISMATIC, eD6 };
@@ -1455,6 +1464,22 @@ void AvbdDynamicsContext::prepareAvbdConstraints(
       PhysXJointType jointType =
           getJointTypeFromConstraint(constraint->jointType);
 
+#if AVBD_JOINT_DEBUG
+      if (getAvbdMotorFrameCounter() < AVBD_JOINT_DEBUG_FRAMES) {
+        printf("[Constraint Parse] type: %d, internal type: %d, block size: "
+               "%u, expected: %zu\n",
+               jointType, constraint->jointType, constraint->constantBlockSize,
+               sizeof(PhysXJointData));
+        if (constraint->constantBlockSize >= sizeof(PhysXJointData)) {
+          const PhysXJointData *physXData =
+              static_cast<const PhysXJointData *>(constraint->constantBlock);
+          printf("  -> invMassScale0: %f, c2b0.p.x: %f, c2b1.p.x: %f\n",
+                 physXData->invMassScale.linear0, physXData->c2b[0].p.x,
+                 physXData->c2b[1].p.x);
+        }
+      }
+#endif
+
       if (jointType == eJOINT_GEAR) {
         // Process GearJoint
         if (numGear < maxGear && gearConstraints) {
@@ -1593,6 +1618,53 @@ void AvbdDynamicsContext::prepareAvbdConstraints(
                 c.motorEnabled = 0;
                 c.motorTargetVelocity = 0.0f;
                 c.motorMaxForce = 0.0f;
+              }
+
+              c.header.rho = AvbdConstants::AVBD_DEFAULT_PENALTY_RHO_HIGH;
+            }
+            break;
+          }
+
+          case eJOINT_PRISMATIC: {
+            if (numPrismatic < maxPrismatic) {
+              const PhysXPrismaticJointData *prismaticData =
+                  static_cast<const PhysXPrismaticJointData *>(
+                      constraint->constantBlock);
+
+#if AVBD_JOINT_DEBUG
+              if (getAvbdMotorFrameCounter() < AVBD_JOINT_DEBUG_FRAMES) {
+                printf("[Parse Prismatic] sizeof(PhysXPrismaticJointData)=%zu, "
+                       "flags=%u, limit(L=%f, U=%f)\n",
+                       sizeof(PhysXPrismaticJointData),
+                       (unsigned int)prismaticData->jointFlags,
+                       prismaticData->limit.lower, prismaticData->limit.upper);
+              }
+#endif
+
+              AvbdPrismaticJointConstraint &c =
+                  prismaticConstraints[numPrismatic++];
+              c.initDefaults();
+              c.header.bodyIndexA = localBody0;
+              c.header.bodyIndexB = localBody1;
+              c.anchorA = anchorA;
+              c.anchorB = anchorB;
+
+              // Prismatic joint slides along X-axis in joint frame
+              c.axisA = frameA.getBasisVector0(); // X-axis of joint frame A
+
+              c.localFrameA = frameA;
+              c.localFrameB = frameB;
+
+              // Check for limits
+              // PxPrismaticJointFlag::eLIMIT_ENABLED = 2
+              if (prismaticData->jointFlags & AVBD_PRISMATIC_LIMIT_ENABLED_FLAG) {
+                c.hasLimit = 1;
+                c.limitLower = prismaticData->limit.lower;
+                c.limitUpper = prismaticData->limit.upper;
+              } else {
+                c.hasLimit = 0;
+                c.limitLower = -PX_MAX_F32;
+                c.limitUpper = PX_MAX_F32;
               }
 
               c.header.rho = AvbdConstants::AVBD_DEFAULT_PENALTY_RHO_HIGH;
@@ -2123,7 +2195,8 @@ void AvbdDynamicsContext::prepareContacts(const IG::IslandSim &islandSim) {
 
 void AvbdDynamicsContext::mergeResults() {
   // Clean up any heap fallback allocations from this frame
-  // No mutex needed since mergeResults() is called from a single thread context
+  // No mutex needed since mergeResults() is called from a single thread
+  // context
   if (mHeapFallbackAllocations.size() > 0 && mAllocatorCallback) {
     PxAllocatorCallback *allocator =
         reinterpret_cast<PxAllocatorCallback *>(mAllocatorCallback);

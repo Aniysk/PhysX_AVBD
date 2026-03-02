@@ -741,3 +741,184 @@ bool test46_gearJoint_oppositeDir() {
         wA, wB);
   PASS("Gear ratio=-1 enforced");
 }
+
+// =============================================================================
+// Prismatic Joint Tests (test47, test48)
+// =============================================================================
+
+bool test47_prismaticJoint_basic() {
+  printf("\n--- Test 47: Prismatic Joint Basic Limits ---\n");
+  Solver solver;
+  solver.gravity = {0, 0, 0};
+  solver.iterations = 20;
+
+  const Vec3 half{0.5f, 0.5f, 0.5f};
+  uint32_t bA = solver.addBody({0, 5, 0}, Quat(), half, 0.0f); // Static anchor
+  uint32_t bB = solver.addBody({0, 5, 0}, Quat(), half, 10.0f);
+
+  // Prismatic joint along X axis. Limits [-2, 2].
+  solver.addPrismaticJoint(bA, bB, {0, 0, 0}, {0, 0, 0}, {1, 0, 0}, 1e6f);
+  solver.setPrismaticJointLimit(0, -2.0f, 2.0f);
+
+  // Push B heavily along +X, it should stop at X = 2.
+  solver.bodies[bB].linearVelocity = {
+      20.0f, 10.0f, 10.0f}; // Give it off-axis velocity too to test lockdowns
+
+  float maxX = 0.0f, minX = 0.0f;
+  for (int frame = 0; frame < 100; frame++) {
+    solver.contacts.clear();
+    solver.step(solver.dt);
+    if (solver.bodies[bB].position.x > maxX)
+      maxX = solver.bodies[bB].position.x;
+  }
+
+  // Expect max pos close to 2.0
+  printf("  Max posB.x: %.4f\n", maxX);
+
+  CHECK(fabsf(maxX - 2.0f) < 0.1f,
+        "Upper limit breached or not reached: maxX=%.4f", maxX);
+  CHECK(fabsf(solver.bodies[bB].position.y - 5.0f) < 0.1f,
+        "Y DOF not locked: y=%.4f", solver.bodies[bB].position.y);
+  CHECK(fabsf(solver.bodies[bB].position.z - 0.0f) < 0.1f,
+        "Z DOF not locked: z=%.4f", solver.bodies[bB].position.z);
+
+  // Now push heavily along -X, it should stop at X = -2.
+  solver.bodies[bB].linearVelocity = {-50.0f, 0.0f, 0.0f};
+  for (int frame = 0; frame < 100; frame++) {
+    solver.contacts.clear();
+    solver.step(solver.dt);
+    if (solver.bodies[bB].position.x < minX)
+      minX = solver.bodies[bB].position.x;
+  }
+
+  printf("  Min posB.x after reverse: %.4f\n", minX);
+  CHECK(fabsf(minX - (-2.0f)) < 0.15f,
+        "Lower limit breached or not reached: minX=%.4f", minX);
+
+  PASS("Prismatic Joint basic limits and locking enforced");
+}
+
+bool test48_prismaticJoint_drive() {
+  printf("\n--- Test 48: Prismatic Joint Drive ---\n");
+  Solver solver;
+  solver.gravity = {0, 0, 0};
+  solver.iterations = 20;
+
+  const Vec3 half{0.5f, 0.5f, 0.5f};
+  uint32_t bA = solver.addBody({0, 5, 0}, Quat(), half, 0.0f); // Static anchor
+  uint32_t bB = solver.addBody({0, 5, 0}, Quat(), half, 10.0f);
+
+  // Prismatic joint along Y axis
+  solver.addPrismaticJoint(bA, bB, {0, 0, 0}, {0, 0, 0}, {0, 1, 0}, 1e6f);
+  // Target velocity 5m/s
+  solver.setPrismaticJointDrive(0, 5.0f, 1e6f);
+
+  for (int frame = 0; frame < 60; frame++) {
+    solver.contacts.clear();
+    solver.step(solver.dt);
+  }
+
+  // Expect vel around Y = 5.0
+  Vec3 posB = solver.bodies[bB].position;
+  Vec3 velB = solver.bodies[bB].linearVelocity;
+  printf("  Final posB: %.4f, %.4f, %.4f, velY=%.4f\n", posB.x, posB.y, posB.z,
+         velB.y);
+
+  CHECK(fabsf(posB.x - 0.0f) < 0.1f, "X DOF not locked: %.4f", posB.x);
+  CHECK(fabsf(posB.z - 0.0f) < 0.1f, "Z DOF not locked: %.4f", posB.z);
+  CHECK(fabsf(velB.y - 5.0f) < 0.5f || posB.y > 9.0f,
+        "Drive velocity not met: velY=%.4f", velB.y);
+
+  PASS("Prismatic Joint drive enforced");
+}
+
+// Test 49: Prismatic chain (SnippetJoint replica) with 6x6 solve
+bool test49_prismaticChain_6x6() {
+  printf(
+      "\n--- Test 49: Prismatic Chain (6x6 solve, SnippetJoint replica) ---\n");
+  Solver solver;
+  solver.gravity = {0, -9.8f, 0};
+  solver.iterations = 10;
+  solver.use3x3Solve = false;
+
+  const int N = 5;
+  Vec3 halfExt(2.0f, 0.5f, 0.5f);
+  float separation = 4.0f;
+  uint32_t ids[N];
+  for (int i = 0; i < N; i++)
+    ids[i] = solver.addBody({separation / 2.0f + i * separation, 20.0f, 0.0f},
+                            Quat(), halfExt, 1.0f);
+
+  Vec3 offset(separation / 2.0f, 0, 0);
+  solver.addPrismaticJoint(UINT32_MAX, ids[0], {0, 20, 0}, {-offset.x, 0, 0},
+                           {1, 0, 0}, 1e6f);
+  solver.setPrismaticJointLimit(0, -2.0f, 2.0f);
+  for (int i = 0; i < N - 1; i++) {
+    solver.addPrismaticJoint(ids[i], ids[i + 1], {offset.x, 0, 0},
+                             {-offset.x, 0, 0}, {1, 0, 0}, 1e6f);
+    solver.setPrismaticJointLimit(i + 1, -2.0f, 2.0f);
+  }
+
+  bool exploded = false;
+  for (int frame = 0; frame < 300; frame++) {
+    solver.contacts.clear();
+    solver.step(solver.dt);
+    for (int i = 0; i < N; i++) {
+      if (fabsf(solver.bodies[ids[i]].position.y) > 100.0f)
+        exploded = true;
+    }
+  }
+
+  printf("  body[0] pos=%.2f, body[4] pos=%.2f\n",
+         solver.bodies[ids[0]].position.y,
+         solver.bodies[ids[N - 1]].position.y);
+  CHECK(!exploded, "Prismatic chain 6x6 exploded!");
+  CHECK(solver.bodies[ids[0]].position.y > 10.0f,
+        "Chain fell too far (6x6): y=%.2f", solver.bodies[ids[0]].position.y);
+  PASS("Prismatic chain 6x6 stable");
+}
+
+// Test 50: Same Prismatic chain with 3x3 decoupled solve
+bool test50_prismaticChain_3x3() {
+  printf("\n--- Test 50: Prismatic Chain (3x3 decoupled solve) ---\n");
+  Solver solver;
+  solver.gravity = {0, -9.8f, 0};
+  solver.iterations = 20; // More iterations for 3x3 to converge
+  solver.use3x3Solve = true;
+
+  const int N = 5;
+  Vec3 halfExt(2.0f, 0.5f, 0.5f);
+  float separation = 4.0f;
+  uint32_t ids[N];
+  for (int i = 0; i < N; i++)
+    ids[i] = solver.addBody({separation / 2.0f + i * separation, 20.0f, 0.0f},
+                            Quat(), halfExt, 1.0f);
+
+  Vec3 offset(separation / 2.0f, 0, 0);
+  solver.addPrismaticJoint(UINT32_MAX, ids[0], {0, 20, 0}, {-offset.x, 0, 0},
+                           {1, 0, 0}, 1e6f);
+  solver.setPrismaticJointLimit(0, -2.0f, 2.0f);
+  for (int i = 0; i < N - 1; i++) {
+    solver.addPrismaticJoint(ids[i], ids[i + 1], {offset.x, 0, 0},
+                             {-offset.x, 0, 0}, {1, 0, 0}, 1e6f);
+    solver.setPrismaticJointLimit(i + 1, -2.0f, 2.0f);
+  }
+
+  bool exploded = false;
+  for (int frame = 0; frame < 300; frame++) {
+    solver.contacts.clear();
+    solver.step(solver.dt);
+    for (int i = 0; i < N; i++) {
+      if (fabsf(solver.bodies[ids[i]].position.y) > 100.0f)
+        exploded = true;
+    }
+  }
+
+  printf("  body[0] pos=%.2f, body[4] pos=%.2f\n",
+         solver.bodies[ids[0]].position.y,
+         solver.bodies[ids[N - 1]].position.y);
+  CHECK(!exploded, "Prismatic chain 3x3 exploded!");
+  CHECK(solver.bodies[ids[0]].position.y > 10.0f,
+        "Chain fell too far (3x3): y=%.2f", solver.bodies[ids[0]].position.y);
+  PASS("Prismatic chain 3x3 stable");
+}

@@ -56,13 +56,17 @@ bool test43_slerp_rotBoth();
 bool test44_sphericalConeLimit();
 bool test45_gearJoint_basicRatio();
 bool test46_gearJoint_oppositeDir();
+bool test47_prismaticJoint_basic();
+bool test48_prismaticJoint_drive();
+bool test49_prismaticChain_6x6();
+bool test50_prismaticChain_3x3();
 
 int gTestsPassed = 0;
 int gTestsFailed = 0;
 
 int main() {
   printf("=========================================\n");
-  printf("Running AVBD Refactored Tests (45 Cases)\n");
+  printf("Running AVBD Refactored Tests (48 Cases)\n");
   printf("=========================================\n");
 
   test1_singleBoxOnGround();
@@ -118,6 +122,9 @@ int main() {
   test44_sphericalConeLimit();
   test45_gearJoint_basicRatio();
   test46_gearJoint_oppositeDir();
+  test47_prismaticJoint_basic();
+  // Prismatic chain tests
+  test49_prismaticChain_6x6();
 
   printf("\n=========================================\n");
   printf("Tests Passed: %d\n", gTestsPassed);

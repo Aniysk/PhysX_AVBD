@@ -27,6 +27,7 @@ struct Solver {
   std::vector<FixedJoint> fixedJoints;
   std::vector<D6Joint> d6Joints;
   std::vector<GearJoint> gearJoints;
+  std::vector<PrismaticJoint> prismaticJoints;
 
   // Joint creation
   void addFixedJoint(uint32_t bodyA, uint32_t bodyB, Vec3 localAnchorA,
@@ -46,6 +47,13 @@ struct Solver {
   // ratio =  2  => B spins twice as fast as A
   void addGearJoint(uint32_t bodyA, uint32_t bodyB, Vec3 axisA, Vec3 axisB,
                     float ratio = -1.f, float rho = 1e5f);
+
+  void addPrismaticJoint(uint32_t bodyA, uint32_t bodyB, Vec3 localAnchorA,
+                         Vec3 localAnchorB, Vec3 localAxisA, float rho = 1e6f);
+  void setPrismaticJointLimit(uint32_t jointIdx, float lowerLimit,
+                              float upperLimit);
+  void setPrismaticJointDrive(uint32_t jointIdx, float targetVelocity,
+                              float damping);
 
   // Body creation
   uint32_t addBody(Vec3 pos, Quat rot, Vec3 halfExtent, float density,

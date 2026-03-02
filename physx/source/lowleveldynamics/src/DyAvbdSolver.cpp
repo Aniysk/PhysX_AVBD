@@ -35,8 +35,13 @@
 #include <cstdio>
 
 // Enable detailed joint solver diagnostics (first N frames)
-#define AVBD_JOINT_DEBUG 1
-#define AVBD_JOINT_DEBUG_FRAMES 5
+#ifndef AVBD_JOINT_DEBUG
+#define AVBD_JOINT_DEBUG 0
+#endif
+// Number of frames to output debug info for joint testing
+#ifndef AVBD_JOINT_DEBUG_FRAMES
+#define AVBD_JOINT_DEBUG_FRAMES 200
+#endif
 
 // External frame counter from DyAvbdDynamics.cpp (used by motor drives)
 extern physx::PxU64 getAvbdMotorFrameCounter();
@@ -925,6 +930,8 @@ void AvbdSolver::solveLocalSystemWithJoints(
   physx::PxVec3 gAngular = (inertiaTensor * rotError) * invDt2;
 
   physx::PxU32 numTouching = 0;
+  bool hasPrismatic =
+      false; // Force 6x6 solve for bodies touching Prismatic joints
 
   // =========================================================================
   // Step 3a: Accumulate CONTACT contributions (same as solveLocalSystem)
@@ -1857,14 +1864,155 @@ void AvbdSolver::solveLocalSystemWithJoints(
     }
   }
 
-  // TODO: Add revolute, prismatic joint Jacobian accumulation
+  // =========================================================================
+  // Step 3f: Accumulate PRISMATIC JOINT contributions
+  //   Position (2 rows): error perpendicular to slide axis
+  //   Rotation (3 rows): full rotation lock (same as fixed)
+  //   Limit (1 inequality row): slide position along axis
+  // =========================================================================
+  if (prismaticJoints && numPrismatic > 0) {
+    const physx::PxU32 *mapIndices = nullptr;
+    physx::PxU32 mapCount = 0;
+    if (prismaticMap && prismaticMap->numBodies > 0)
+      prismaticMap->getBodyConstraints(bodyIndex, mapIndices, mapCount);
+    const physx::PxU32 loopCount = mapIndices ? mapCount : numPrismatic;
+
+    for (physx::PxU32 ji = 0; ji < loopCount; ++ji) {
+      const physx::PxU32 j = mapIndices ? mapIndices[ji] : ji;
+      if (j >= numPrismatic)
+        continue;
+      const AvbdPrismaticJointConstraint &jnt = prismaticJoints[j];
+      const physx::PxU32 bodyAIdx = jnt.header.bodyIndexA;
+      const physx::PxU32 bodyBIdx = jnt.header.bodyIndexB;
+
+      if (bodyAIdx != bodyIndex && bodyBIdx != bodyIndex)
+        continue;
+
+      const bool isBodyA = (bodyAIdx == bodyIndex);
+      const bool otherIsStatic =
+          isBodyA ? (bodyBIdx == 0xFFFFFFFF || bodyBIdx >= numBodies)
+                  : (bodyAIdx == 0xFFFFFFFF || bodyAIdx >= numBodies);
+
+      physx::PxReal mA =
+          (bodyAIdx < numBodies && bodies[bodyAIdx].invMass > 1e-8f)
+              ? (1.0f / bodies[bodyAIdx].invMass)
+              : 0.0f;
+      physx::PxReal mB =
+          (bodyBIdx < numBodies && bodies[bodyBIdx].invMass > 1e-8f)
+              ? (1.0f / bodies[bodyBIdx].invMass)
+              : 0.0f;
+      physx::PxReal mEff = physx::PxMax(mA, mB);
+
+      physx::PxReal pen = physx::PxMax(jnt.header.rho, mEff * invDt2);
+      physx::PxReal signJ = isBodyA ? 1.0f : -1.0f;
+
+      // Compute world anchors and lever arm
+      physx::PxVec3 worldAnchorA, worldAnchorB;
+      physx::PxVec3 r;
+      physx::PxQuat rotA, rotB;
+      if (isBodyA) {
+        r = body.rotation.rotate(jnt.anchorA);
+        worldAnchorA = body.position + r;
+        worldAnchorB = otherIsStatic
+                           ? jnt.anchorB
+                           : bodies[bodyBIdx].position +
+                                 bodies[bodyBIdx].rotation.rotate(jnt.anchorB);
+        rotA = body.rotation;
+        rotB = otherIsStatic ? physx::PxQuat(physx::PxIdentity)
+                             : bodies[bodyBIdx].rotation;
+      } else {
+        r = body.rotation.rotate(jnt.anchorB);
+        worldAnchorB = body.position + r;
+        worldAnchorA = otherIsStatic
+                           ? jnt.anchorA
+                           : bodies[bodyAIdx].position +
+                                 bodies[bodyAIdx].rotation.rotate(jnt.anchorA);
+        rotA = otherIsStatic ? physx::PxQuat(physx::PxIdentity)
+                             : bodies[bodyAIdx].rotation;
+        rotB = body.rotation;
+      }
+
+      // Compute world slide axis
+      physx::PxVec3 worldAxis = rotA.rotate(jnt.axisA);
+
+      // --- Position rows (3 world-axis DOF, slide-axis component removed) ---
+      // Uses the same world-axis pattern as Fixed joints for well-conditioned
+      // Hessian. The position error is projected to remove the slide-axis
+      // component, allowing free sliding along the axis.
+      {
+        physx::PxVec3 posError = worldAnchorA - worldAnchorB;
+        // Remove the slide-axis component so sliding is free
+        posError -= worldAxis * posError.dot(worldAxis);
+
+        for (int axis = 0; axis < 3; ++axis) {
+          physx::PxReal C = posError[axis];
+          physx::PxVec3 n(0.0f);
+          (&n.x)[axis] = 1.0f;
+
+          physx::PxVec3 rCrossN = r.cross(n);
+          physx::PxVec3 gradPos = n * signJ;
+          physx::PxVec3 gradRot = rCrossN * signJ;
+
+          A.addConstraintContribution(gradPos, gradRot, pen);
+
+          physx::PxReal f = pen * C + jnt.lambdaPosition[axis];
+          gLinear += gradPos * f;
+          gAngular += gradRot * f;
+        }
+      }
+
+      // --- Rotation rows (3 DOF - lock relative rotation, same as Fixed) ---
+      {
+        physx::PxVec3 rotErr = jnt.computeRotationViolation(rotA, rotB);
+
+        for (int axis = 0; axis < 3; ++axis) {
+          physx::PxReal C = rotErr[axis];
+          physx::PxVec3 n(0.0f);
+          (&n.x)[axis] = 1.0f;
+
+          physx::PxVec3 gradPos(0.0f);
+          physx::PxVec3 gradRot = n * signJ;
+
+          A.addConstraintContribution(gradPos, gradRot, pen);
+
+          physx::PxReal f = pen * C + jnt.lambdaRotation[axis];
+          gAngular += gradRot * f;
+        }
+      }
+
+      // --- Limit row (1 DOF - inequality along slide axis) ---
+      if (jnt.hasLimit) {
+        physx::PxVec3 diff = worldAnchorB - worldAnchorA;
+        physx::PxReal slidePos = diff.dot(worldAxis);
+        physx::PxReal limitC = jnt.computeLimitViolation(slidePos);
+
+        if (physx::PxAbs(limitC) >
+            AvbdConstants::AVBD_POSITION_ERROR_THRESHOLD) {
+          // Limit direction: -worldAxis (gradient of 'slidePos' w.r.t. body A
+          // position)
+          physx::PxVec3 n = -worldAxis;
+          physx::PxVec3 rCrossN = r.cross(n);
+          physx::PxVec3 gradPos = n * signJ;
+          physx::PxVec3 gradRot = rCrossN * signJ;
+
+          A.addConstraintContribution(gradPos, gradRot, pen);
+
+          physx::PxReal f = pen * limitC + jnt.lambdaLimit;
+          gLinear += gradPos * f;
+          gAngular += gradRot * f;
+        }
+      }
+
+      numTouching++;
+      hasPrismatic = true;
+    }
+  }
+
+  // TODO: Add revolute joint Jacobian accumulation
   // For now they remain as GS fallback in the body loop.
   PX_UNUSED(revoluteJoints);
   PX_UNUSED(numRevolute);
   PX_UNUSED(revoluteMap);
-  PX_UNUSED(prismaticJoints);
-  PX_UNUSED(numPrismatic);
-  PX_UNUSED(prismaticMap);
 
   // =========================================================================
   // Step 3g: Accumulate GEAR JOINT contributions (angular-only, position-level)
@@ -2026,7 +2174,11 @@ void AvbdSolver::solveLocalSystemWithJoints(
   physx::PxVec3 deltaPos;
   physx::PxVec3 deltaTheta;
 
-  if (mConfig.enableLocal6x6Solve) {
+  // Force 6x6 solve for bodies touching Prismatic joints: the 3x3
+  // decoupled solve is incompatible with Prismatic's axis-dependent
+  // position projection, which creates divergent oscillation.
+  const bool use6x6 = mConfig.enableLocal6x6Solve || hasPrismatic;
+  if (use6x6) {
     if (ldlt.decomposeWithRegularization(A)) {
       AvbdVec6 delta = ldlt.solve(rhs);
       deltaPos = delta.linear;
@@ -3189,9 +3341,9 @@ void AvbdSolver::solveWithJoints(
           // AVBD solver (solveLocalSystemWithJoints) above, not GS.
           // const physx::PxReal maxAngleRevolute = 0.20f; // Unused, disabled
           // GS fallback
-          const physx::PxReal maxAnglePrismatic = 0.20f;
-          // maxAngleD6 and maxAngleGear no longer needed (both handled by AVBD
-          // Hessian)
+          // const physx::PxReal maxAnglePrismatic = 0.20f; // Unused, disabled
+          // GS fallback maxAngleD6 and maxAngleGear no longer needed (both
+          // handled by AVBD Hessian)
 
           // Helper lambda: apply a single joint correction to body i
           auto applyJointGS = [&](const physx::PxVec3 &dp,
@@ -3242,30 +3394,10 @@ void AvbdSolver::solveWithJoints(
           }
           */
 
-          // Prismatic joints
-          if (prismaticJoints && numPrismatic > 0) {
-            const physx::PxU32 *jIdx = nullptr;
-            physx::PxU32 jCnt = 0;
-            if (prismaticMap) {
-              prismaticMap->getBodyConstraints(i, jIdx, jCnt);
-              for (physx::PxU32 k = 0; k < jCnt; ++k) {
-                if (jIdx[k] >= numPrismatic)
-                  continue;
-                physx::PxVec3 dp, dth;
-                if (computePrismaticJointCorrection(prismaticJoints[jIdx[k]],
-                                                    bodies, numBodies, i, dp,
-                                                    dth))
-                  applyJointGS(dp, dth, maxAnglePrismatic);
-              }
-            } else {
-              for (physx::PxU32 k = 0; k < numPrismatic; ++k) {
-                physx::PxVec3 dp, dth;
-                if (computePrismaticJointCorrection(prismaticJoints[k], bodies,
-                                                    numBodies, i, dp, dth))
-                  applyJointGS(dp, dth, maxAnglePrismatic);
-              }
-            }
-          }
+          // Prismatic joints -- now handled by processPrismaticJointConstraint
+          // in the outer AL loop. GS fallback disabled: it fought the outer
+          // AL solve and caused oscillation/divergence (same issue as D6/Gear).
+          // if (prismaticJoints && numPrismatic > 0) { ... }
 
           // D6 joints -- now handled in solveLocalSystemWithJoints (AVBD
           // Hessian) GS fallback disabled. if (d6Joints && numD6 > 0) { ... }
@@ -3275,6 +3407,7 @@ void AvbdSolver::solveWithJoints(
           // GS fallback removed: it fought the Hessian and caused divergence.
 
         } // end body loop
+
         mStats.totalIterations++;
       }
 
@@ -3480,6 +3613,70 @@ void AvbdSolver::solveWithJoints(
                 }
               } else {
                 jnt.lambdaAngleLimit = newLam;
+              }
+            }
+          }
+
+          // Prismatic joints
+          for (physx::PxU32 j = 0; j < numPrismatic; ++j) {
+            AvbdPrismaticJointConstraint &jnt = prismaticJoints[j];
+            physx::PxReal rhoDual = computeRhoDual(
+                jnt.header.bodyIndexA, jnt.header.bodyIndexB, jnt.header.rho);
+
+            if (rhoDual <= 0.0f)
+              continue;
+            bool aStatic = (jnt.header.bodyIndexA == 0xFFFFFFFF ||
+                            jnt.header.bodyIndexA >= numBodies);
+            bool bStatic = (jnt.header.bodyIndexB == 0xFFFFFFFF ||
+                            jnt.header.bodyIndexB >= numBodies);
+            physx::PxVec3 wA =
+                aStatic ? jnt.anchorA
+                        : bodies[jnt.header.bodyIndexA].position +
+                              bodies[jnt.header.bodyIndexA].rotation.rotate(
+                                  jnt.anchorA);
+            physx::PxVec3 wB =
+                bStatic ? jnt.anchorB
+                        : bodies[jnt.header.bodyIndexB].position +
+                              bodies[jnt.header.bodyIndexB].rotation.rotate(
+                                  jnt.anchorB);
+            physx::PxQuat rotA = aStatic
+                                     ? physx::PxQuat(physx::PxIdentity)
+                                     : bodies[jnt.header.bodyIndexA].rotation;
+            physx::PxQuat rotB = bStatic
+                                     ? physx::PxQuat(physx::PxIdentity)
+                                     : bodies[jnt.header.bodyIndexB].rotation;
+
+            // Position (3 DOF world-axis, slide-axis projected out)
+            physx::PxVec3 posError = wA - wB;
+            physx::PxVec3 worldAxis = rotA.rotate(jnt.axisA);
+            // Remove slide-axis component to allow free sliding
+            posError -= worldAxis * posError.dot(worldAxis);
+
+            jnt.lambdaPosition =
+                jnt.lambdaPosition * lambdaDecay + posError * rhoDual;
+
+            // Rotation (3 DOF)
+            jnt.lambdaRotation =
+                jnt.lambdaRotation * lambdaDecay +
+                jnt.computeRotationViolation(rotA, rotB) * rhoDual;
+
+            // Limit
+            if (jnt.hasLimit) {
+              physx::PxReal slidePos = (wB - wA).dot(worldAxis);
+              physx::PxReal limitViol = jnt.computeLimitViolation(slidePos);
+              physx::PxReal newLam =
+                  jnt.lambdaLimit * lambdaDecay + limitViol * rhoDual;
+
+              if (jnt.limitLower < jnt.limitUpper) {
+                if (limitViol > 0.0f || jnt.lambdaLimit > 0.0f) {
+                  jnt.lambdaLimit = physx::PxMax(0.0f, newLam);
+                } else if (limitViol < 0.0f || jnt.lambdaLimit < 0.0f) {
+                  jnt.lambdaLimit = physx::PxMin(0.0f, newLam);
+                } else {
+                  jnt.lambdaLimit = 0.0f;
+                }
+              } else {
+                jnt.lambdaLimit = newLam;
               }
             }
           }

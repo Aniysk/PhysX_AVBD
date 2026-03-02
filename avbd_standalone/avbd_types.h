@@ -236,4 +236,39 @@ struct GearJoint {
       : bodyA(0), bodyB(0), gearRatio(1.f), lambdaGear(0.f), rho(1e5f) {}
 };
 
+// Prismatic Joint: locks 3 rotational DOFs and 2 linear DOFs. Allows 1 linear
+// DOF along axis.
+struct PrismaticJoint {
+  uint32_t bodyA;
+  uint32_t bodyB;
+  Vec3 anchorA; // local frame (or world if static)
+  Vec3 anchorB;
+  Vec3 axisA; // Slider axis in A's local frame (normalized)
+
+  Quat relativeRotation; // Target: rotA^-1 * rotB
+
+  Vec3 lambdaRot; // 3 rotational DOFs
+  Vec3 lambdaPos; // 3 world-axis DOFs (slide-axis projected out)
+
+  // Limits
+  bool limitEnabled;
+  float limitLower;
+  float limitUpper;
+  float limitLambda;
+
+  // Drive (velocity-level)
+  bool driveEnabled;
+  float driveTargetVelocity;
+  float driveDamping;
+  float driveLambda;
+
+  float rho;
+
+  PrismaticJoint()
+      : bodyA(UINT32_MAX), bodyB(0), lambdaRot(Vec3()), lambdaPos(Vec3()),
+        limitEnabled(false), limitLower(0.f), limitUpper(0.f), limitLambda(0.f),
+        driveEnabled(false), driveTargetVelocity(0.f), driveDamping(0.f),
+        driveLambda(0.f), rho(1e6f) {}
+};
+
 } // namespace AvbdRef

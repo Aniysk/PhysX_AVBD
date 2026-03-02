@@ -4,74 +4,78 @@
 
 Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved. BSD-3-Clause License.
 
-## Project Status
+## ⚠️ Project Status
+
+Status Legend: `Integrated` = merged into main code path; `Accepted` = integrated and fully validated by current acceptance gates; `Pending` = not complete or acceptance not closed.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Contact Solver | ✅ Working | AL outer loop + 6x6 Hessian local solve |
-| Spherical Joint | ✅ AVBD Hessian | In local system (6x6 + 3x3), with stabilized dual update |
-| Fixed Joint | ✅ AVBD Hessian | Position + rotation rows, with stabilized dual update |
-| D6 Joint | ✅ AVBD Hessian | Locked linear DOFs + angular damping in local system |
-| Revolute Joint | ⚠️ GS Fallback | Gauss-Seidel correction, not yet in Hessian |
-| Prismatic Joint | ⚠️ GS Fallback | Gauss-Seidel correction, not yet in Hessian |
-| Gear Joint | ✅ AVBD Hessian | Unified AL position solver integrated in 6x6 / 3x3 Hessian |
-| Motor Drive | ✅ Working | Linear, Twist, Swing, and SLERP AL drives implemented |
-| Joint Limits | ⚠️ Partial | Limits exist, but drive/limit stability still being retuned |
-| SnippetChainmail | ✅ Added | Extreme stress scene for dense joint mesh + high-speed impact |
-| 3x3 Decoupled Path | ⚠️ Functional with limits | Joints included in accumulation, but dense mesh impact is weaker than 6x6 |
-| O(K) Constraint Lookup | ✅ Optimized | Per-body constraint map eliminates O(N) scan |
-| Multi-threaded Islands | ✅ Thread-safe | Per-island constraint mappings |
-| Custom Joint | ❌ Not Available | Custom constraint callbacks unsupported |
-| Rack & Pinion | ❌ Not Available | RackAndPinionJoint unsupported |
-| Mimic Joint | ❌ Not Available | MimicJoint unsupported |
-| Articulation | ❌ Not Available | Currently unsupported |
-| Sleep / Wake | ❌ Not Available | Not implemented |
+| Rigid Body Solver | ✅ Accepted | Contacts + unified AVBD local solve |
+| Joint System | ⚠️ Integrated | Revolute, Prismatic, Spherical, Fixed, D6, Gear (Revolute acceptance pending) |
+| Motor Drive | ⚠️ Integrated | Torque-based RevoluteJoint motor (needs scenario acceptance coverage) |
+| Joint Limits | ⚠️ Integrated | Revolute, Prismatic, Spherical cone, D6 |
+| Prismatic Hessian Path | ✅ Integrated | Position/rotation/limit rows accumulated in local Hessian |
+| Prismatic 3x3 Fallback | ✅ Accepted | Bodies touching Prismatic are forced to 6x6 local solve |
+| Standalone Alignment | ✅ Accepted | Prismatic limit sign/dual update aligned with PhysX path |
+| Regression Baseline | ✅ Accepted | Default standalone suite runs 48 aligned cases |
+| Custom Joint | ⏳ Pending | Custom constraint callbacks unsupported |
+| Rack & Pinion | ⏳ Pending | RackAndPinionJoint unsupported |
+| Mimic Joint | ⏳ Pending | MimicJoint unsupported |
+| O(M) Constraint Lookup | ✅ Accepted | Eliminates O(N²) complexity |
+| Multi-threaded Islands | ✅ Accepted | Per-island constraint mappings |
+| Articulation | ⏳ Pending | Currently unsupported |
+| Sleep / Wake | ⏳ Pending | Not implemented |
+| Friction Model | ⚠️ Integrated | Coulomb approximation |
 
 **For research and evaluation only. Not production-ready.**
 
+## Recent Progress (2026-03)
+
+- Prismatic joint has been migrated to the AVBD Hessian path in PhysX (primal accumulation + dual multiplier update).
+- Debug defaults were cleaned up (joint debug disabled by default; named limit-flag constant used in parsing).
+- Prismatic constraint comments were aligned with implementation semantics (3 world-axis projected rows).
+- `avbd_standalone` was synchronized with PhysX behavior for prismatic limit handling and solve-path selection.
+- Default standalone regression now excludes non-PhysX baseline cases (`prismatic drive`, `prismatic 3x3 chain`).
+
 ### Current Validation Snapshot
 
-- ✅ Joint chain stability under 3x3 and 6x6 local solves (with spherical/fixed/D6 accumulation)
-- ✅ `SnippetChainmail` integrated for extreme impact regression testing
-- ✅ `SnippetJointDrive` fully working with AVBD Slerp, Twist, Swing, and Linear configurations
-- ⚠️ 3x3 path is kept for cost/perf fallback, but dense joint-mesh impact scenes should prefer 6x6
+- ✅ Standalone aligned regression baseline passes (48/48 default suite).
+- ✅ `SnippetChainmail` remains integrated for extreme impact and dense-joint stress regression.
+- ✅ Prismatic baseline scenes validated under Hessian path + 6x6-on-touch policy.
+- ⚠️ Revolute is integrated in solver code path, but full completion is pending SnippetJoint visual validation and acceptance checks.
 
 ## SnippetChainmail Demo
 
-
-
 https://github.com/user-attachments/assets/2ab299c7-8f7f-4bf2-b8b5-7de8033b17f8
-
-
 
 ## Why AVBD?
 
 PhysX's built-in TGS/PGS are **velocity-level** iterative solvers that hit fundamental limits in several scenarios:
 
-| Problem | TGS/PGS Limitation | AVBD Solution |
-|---------|---------------------|---------------|
-| **High mass-ratio joints** | Condition number explosion, rubber-banding | Augmented Lagrangian, mass-ratio-insensitive convergence |
-| **Multiplayer sync** | Velocity integration accumulates FP error | Position-level solve, better cross-platform consistency |
-| **Cloth & soft body** | Requires separate solver | Position-level block descent maps to CPU SIMD / GPU compute |
+| Problem | TGS/PGS Limitation | AVBD Direction |
+|---------|---------------------|----------------|
+| **High mass-ratio joints** | Condition number explosion, rubber-banding | Augmented Lagrangian + local Hessian solve |
+| **Multiplayer sync** | Velocity integration accumulates FP error | Position-level solve with stronger state consistency |
+| **Cloth & soft body** | Requires separate solver pipelines | Position-level framework is more naturally extensible |
 
-AVBD introduces a **unified position-level constraint solving framework** to support:
+AVBD introduces a **unified position-level constraint solving framework** targeting:
 
-1. **"Ultra Hand" gameplay** -- A kinematic hand (infinite mass) grips light objects via joints. Requires unconditionally stable high mass-ratio joint solving.
-2. **Whole-scene solver** -- AVBD as the sole solver for the entire scene. All rigid bodies must solve stably.
-3. **Multiplayer determinism** -- Position-level solving avoids velocity integration error accumulation.
-4. **Cloth & soft body unification** -- Per-body Jacobi structure extends to deformable bodies.
+1. Stable high mass-ratio interaction chains.
+2. Whole-scene robustness under mixed contact/joint constraints.
+3. Better deterministic behavior for server-authoritative simulation.
+4. Future rigid/soft-body unification on a common optimization-style solver structure.
 
-### Roadmap
+### Roadmap Snapshot
 
 ```
 Contact AL stability (DONE)         Joint Hessian integration (IN PROGRESS)
-  Rigid body contacts stable      ->    Spherical, Fixed, D6: DONE
-  AVBD usable as whole-scene solver     Revolute, Prismatic: TODO (Gear Done)
-            |                                    |
-  Lambda warm-starting                 Cloth / soft body / GPU
-  Reduce iterations -> performance     Unified solver architecture
-            |                                    |
-              Multiplayer determinism across all the above
+	Rigid body contacts stable      ->    Spherical/Fixed/D6/Gear/Prismatic: integrated
+	AVBD usable as whole-scene solver     Revolute: integrated, acceptance pending
+						|                                    |
+	Lambda warm-starting                 Soft body / articulation / performance
+	Iteration-efficiency tuning          Unified solver architecture
+						|                                    |
+							Multiplayer determinism across all the above
 ```
 
 > See [docs/AVBD_SOLVER_README.md](docs/AVBD_SOLVER_README.md) and [docs/SOLVER_ALGORITHM_ANALYSIS.md](docs/SOLVER_ALGORITHM_ANALYSIS.md) for details.
@@ -80,50 +84,48 @@ Contact AL stability (DONE)         Joint Hessian integration (IN PROGRESS)
 
 ### Unified AVBD Hessian Approach
 
-The solver accumulates **contacts and joints** into a single per-body 6x6 Hessian system, then solves via LDLT:
+The solver accumulates **contacts and joints** into a per-body local system (typically 6x6), then solves via LDLT:
 
 ```
 For each body i:
-  H = M/h^2 * I_6x6                       (inertia)
-  g = M/h^2 * (x_i - x_tilde)             (inertial RHS)
+	H = M/h^2 * I_6x6
+	g = M/h^2 * (x_i - x_tilde)
 
-  For each contact on body i:
-    H += rho * J^T J                       (contact penalty)
-    g += J * (rho * C + lambda)            (contact gradient)
+	For each contact/joint row:
+		H += rho_eff * J^T J
+		g += J * (rho_eff * C + lambda)
 
-  For each spherical/fixed/D6 joint on body i:
-    H += rho_eff * J^T J                   (rho_eff = max(rho, M/h^2))
-    g += J * (rho_eff * C + lambda)        (primal term)
-    H_ang += (damping/h^2) * I_3x3         (angular damping)
-    g_ang += (damping/h^2) * deltaW_init   (damping gradient)
+	Dual update (stabilized AL):
+		rhoDual = min(Mh^2, rho^2/(rho + Mh^2))
+		lambda  = decay * lambda + rhoDual * C
 
-  Joint dual update (stabilized):
-    rhoDual = min(Mh^2, rho^2/(rho + Mh^2))
-    lambda  = decay * lambda + rhoDual * C
-
-  delta = LDLT_solve(H, g)
-  x_i -= delta
+	delta = LDLT_solve(H, g)
+	x_i -= delta
 ```
 
 ### Key Design Decisions
 
 | Decision | Rationale |
 |----------|-----------|
-| **Stabilized AL dual for joints** | Uses bounded dual step and decay (`rhoDual`, `lambdaDecay`) to reduce overshoot while keeping AL memory in chain/impact scenarios. |
-| **World-frame rotation error** | Fixed joint `computeRotationViolation` computes error as `(rotA * relRot) * rotB^-1` in world frame, matching the world-frame angular Jacobian `J = [0, e_k]`. |
-| **No joint sign on angular damping** | Damping is a LOCAL property of each body. Using the joint sign (bodyA=+1, bodyB=-1) would flip the gradient for bodyB, injecting energy instead of dissipating it. |
-| **3x3/6x6 accumulation parity** | Both paths now accumulate contacts + spherical/fixed/D6 identically; only local solve differs (6x6 LDLT vs decoupled 3x3 blocks). |
-| **GS immediate-apply for remaining joints** | Revolute and prismatic joints still use GS immediate update while waiting for full Hessian migration. |
+| **Stabilized AL dual for joints** | Bounded dual step + decay (`rhoDual`, `lambdaDecay`) reduces overshoot while retaining AL memory. |
+| **Prismatic force-6x6 on touch** | Prevents instability from 3x3 decoupling under strong position-rotation coupling. |
+| **Standalone/PhysX semantic alignment** | Keep limit violation sign and dual clamp policy consistent to ensure parity. |
+
+## AVBD Solver Overview
+
+AVBD is a position-based constraint solver using:
+- **Block Coordinate Descent** - Per-body 6x6 local system solve
+- **Augmented Lagrangian** - Multiplier updates for constraint satisfaction
+- **Island-level Parallelism** - Independent islands solve concurrently
 
 ### Comparison with TGS/PGS
 
 | Property | PGS | TGS | AVBD |
 |----------|-----|-----|------|
 | Solve Level | Velocity | Velocity | **Position** |
-| Convergence | Linear | Sublinear | AL-augmented |
-| Stack Stability | Fair | Good | **Good** |
-| Mass-ratio Robustness | Poor | Fair | **Good** |
-| Joint Chain Support | N/A | Implicit | **Hessian (Sph/Fix/D6/Gear) + GS (Rev/Pris)** |
+| Convergence | Linear | Sublinear | Quadratic |
+| Stack Stability | Fair | Good | **Excellent** |
+| Cost per Iteration | Low | Medium | Medium-High |
 
 ## Quick Start
 
@@ -146,31 +148,28 @@ sceneDesc.solverType = PxSolverType::eAVBD;
 
 ```
 physx/source/lowleveldynamics/src/
-  DyAvbdSolver.h/cpp       # Core solver (solveLocalSystemWithJoints, solveWithJoints)
-  DyAvbdDynamics.h/cpp      # PhysX integration
-  DyAvbdTasks.h/cpp          # Multi-threading
-  DyAvbdTypes.h              # Config & data structures (AvbdSolverConfig)
-  DyAvbdConstraint.h         # Constraint definitions (all joint types)
-  DyAvbdJointSolver.h/cpp    # Joint multiplier updates, GS corrections
-  DyAvbdSolverBody.h         # Body state
+├── DyAvbdSolver.h/cpp       # Core solver
+├── DyAvbdDynamics.h/cpp     # PhysX integration
+├── DyAvbdTasks.h/cpp        # Multi-threading
+├── DyAvbdTypes.h            # Config & data structures
+├── DyAvbdConstraint.h       # Constraint definitions
+├── DyAvbdJointSolver.h/cpp  # Joint solving
+└── DyAvbdSolverBody.h       # Body state
 ```
 
 ## Profiling
 
-PVD Profile Zones:
-- `AVBD.update` -- Total update time
-- `AVBD.solveWithJoints` -- Main solver loop
-- `AVBD.blockDescentWithJoints` -- Constraint iterations
-- `AVBD.updateLambda` -- Multiplier updates
+PVD Profile Zones available:
+- `AVBD.update` - Total update time
+- `AVBD.solveWithJoints` - Main solver loop
+- `AVBD.blockDescentWithJoints` - Constraint iterations
+- `AVBD.updateLambda` - Multiplier updates
 
 ## Known Limitations
 
-1. **No Articulation support** -- Articulated bodies not implemented
-2. **No Sleep/Wake** -- Bodies remain active
-3. **CPU only** -- No GPU acceleration
-4. **3x3 dense-mesh coupling loss** -- 3x3 decoupled local solve drops linear-angular off-diagonal coupling, so dense joint meshes under impact (e.g. small fast ball on chainmail) are significantly weaker than 6x6
-5. **Revolute/Prismatic not in Hessian** -- still GS fallback, planned for migration into unified local system
-6. **Extreme-scene tuning still in progress** -- chainmail-style stress scenarios required algorithm updates and remain the primary tuning target
+1. **No Articulation support** - Articulated bodies not implemented
+2. **No Sleep/Wake** - Bodies remain active
+3. **CPU only** - No GPU acceleration
 
 ## Original PhysX Documentation
 
@@ -180,4 +179,3 @@ PVD Profile Zones:
 ## License
 
 NVIDIA PhysX BSD-3-Clause. See [LICENSE.md](LICENSE.md).
-

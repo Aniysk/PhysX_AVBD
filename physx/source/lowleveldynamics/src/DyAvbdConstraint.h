@@ -1015,7 +1015,7 @@ struct PX_ALIGN_PREFIX(16) AvbdRevoluteJointConstraint {
  * @brief Prismatic (Slider) joint constraint for AVBD solver
  *
  * Constrains two bodies to move along a single shared axis:
- *   - Position constraint (2 DOF): perpendicular to slide axis
+ *   - Position constraint (3 world-axis rows): slide-axis projection removed
  *   - Rotation constraint (3 DOF): orientations locked
  *   - Free axis: 1 translation DOF along the slide axis
  *
@@ -1023,7 +1023,8 @@ struct PX_ALIGN_PREFIX(16) AvbdRevoluteJointConstraint {
  *   E = 0.5/alpha * ||C||^2 + lambda^T * C
  *
  * Where C includes:
- *   - Perpendicular position error (2D)
+ *   - Position error in 3 world-axis rows with slide-axis component projected
+ *     out
  *   - Relative rotation error (quaternion difference)
  *   - Optional limit constraint (when slide is out of range)
  */
@@ -1050,7 +1051,7 @@ struct PX_ALIGN_PREFIX(16) AvbdPrismaticJointConstraint {
   physx::PxReal motorMaxForce;
 
   // Lagrange multipliers
-  physx::PxVec3 lambdaPosition; // Perpendicular position (2D -> stored in x,y)
+  physx::PxVec3 lambdaPosition; // Projected position multipliers (3 world-axis rows)
   physx::PxVec3 lambdaRotation; // Rotation alignment (3D)
   physx::PxReal lambdaLimit;    // Slide limit
 
@@ -1107,8 +1108,9 @@ struct PX_ALIGN_PREFIX(16) AvbdPrismaticJointConstraint {
     physx::PxQuat worldFrameA = rotA * localFrameA;
     physx::PxQuat worldFrameB = rotB * localFrameB;
 
-    // Compute relative rotation error
-    physx::PxQuat errorQ = worldFrameB.getConjugate() * worldFrameA;
+    // Compute relative rotation error in world space
+    // errorQ * worldFrameB = worldFrameA
+    physx::PxQuat errorQ = worldFrameA * worldFrameB.getConjugate();
     if (errorQ.w < 0.0f)
       errorQ = -errorQ;
 
@@ -1314,8 +1316,8 @@ struct PX_ALIGN_PREFIX(16) AvbdD6JointConstraint {
     physx::PxQuat worldFrameA = rotA * localFrameA;
     physx::PxQuat worldFrameB = rotB * localFrameB;
 
-    // Compute relative rotation
-    physx::PxQuat relRot = worldFrameB.getConjugate() * worldFrameA;
+    // Compute relative rotation in world space (relRot * B = A)
+    physx::PxQuat relRot = worldFrameA * worldFrameB.getConjugate();
     if (relRot.w < 0.0f)
       relRot = -relRot;
 

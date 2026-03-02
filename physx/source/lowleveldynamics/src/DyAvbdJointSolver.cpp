@@ -786,11 +786,11 @@ void processPrismaticJointConstraint(AvbdPrismaticJointConstraint &joint,
       isBStatic ? physx::PxVec3(0) : bodyB.rotation.rotate(joint.anchorB);
 
   // --- Position Constraint (2 DOF - perpendicular to slide axis) ---
-  physx::PxVec3 posDiff = worldAnchorB - worldAnchorA;
+  physx::PxVec3 posError = worldAnchorA - worldAnchorB;
 
   for (int i = 0; i < 2; ++i) {
     physx::PxVec3 n = (i == 0) ? perp1 : perp2;
-    physx::PxReal C = posDiff.dot(n);
+    physx::PxReal C = posError.dot(n);
 
     if (physx::PxAbs(C) < AvbdConstants::AVBD_POSITION_ERROR_THRESHOLD)
       continue;
@@ -879,6 +879,63 @@ void processPrismaticJointConstraint(AvbdPrismaticJointConstraint &joint,
                        -angDelta.z * AvbdConstants::AVBD_QUATERNION_HALF_FACTOR,
                        1.0f);
       bodyB.rotation = (dq * bodyB.rotation).getNormalized();
+    }
+  }
+
+  // --- Limit Constraint (1 DOF - along slide axis) ---
+  if (joint.hasLimit) {
+    physx::PxVec3 diff =
+        worldAnchorB -
+        worldAnchorA; // Note: Limit logic in PhysX generally measures pB - pA.
+    // If we use slidePos = (pB - pA).dot(axisA), a positive slidePos means B is
+    // along the +axis from A.
+    physx::PxReal slidePos = diff.dot(worldAxis);
+
+    // Check limit violation
+    physx::PxReal limitC = joint.computeLimitViolation(slidePos);
+
+#if AVBD_JOINT_DEBUG
+    if (getAvbdMotorFrameCounter() < AVBD_JOINT_DEBUG_FRAMES) {
+      printf("[Prismatic] limitC: %f, slidePos: %f (Range: %f, %f)\n", limitC,
+             slidePos, joint.limitLower, joint.limitUpper);
+    }
+#endif
+
+    if (physx::PxAbs(limitC) >= AvbdConstants::AVBD_POSITION_ERROR_THRESHOLD) {
+      physx::PxVec3 n = -worldAxis; // Note: must be -worldAxis to correspond to
+                                    // d(slidePos)/dpA
+      physx::PxReal w = computeEffectiveInverseMass(bodyA, bodyB, rA, rB, n);
+
+      if (w >= AvbdConstants::AVBD_INFINITE_MASS_THRESHOLD) {
+        physx::PxReal gradient = joint.lambdaLimit + rho * limitC;
+        physx::PxReal stepSize = -gradient / w;
+        stepSize = physx::PxClamp(stepSize, -config.maxPositionCorrection,
+                                  config.maxPositionCorrection);
+
+        physx::PxVec3 impulse = n * stepSize;
+
+        if (!isAStatic) {
+          bodyA.position += impulse * bodyA.invMass;
+          physx::PxVec3 angImpulse = rA.cross(impulse);
+          physx::PxVec3 angDelta = bodyA.invInertiaWorld * angImpulse;
+          physx::PxQuat dq(
+              angDelta.x * AvbdConstants::AVBD_QUATERNION_HALF_FACTOR,
+              angDelta.y * AvbdConstants::AVBD_QUATERNION_HALF_FACTOR,
+              angDelta.z * AvbdConstants::AVBD_QUATERNION_HALF_FACTOR, 1.0f);
+          bodyA.rotation = (dq * bodyA.rotation).getNormalized();
+        }
+
+        if (!isBStatic) {
+          bodyB.position -= impulse * bodyB.invMass;
+          physx::PxVec3 angImpulse = rB.cross(impulse);
+          physx::PxVec3 angDelta = bodyB.invInertiaWorld * angImpulse;
+          physx::PxQuat dq(
+              -angDelta.x * AvbdConstants::AVBD_QUATERNION_HALF_FACTOR,
+              -angDelta.y * AvbdConstants::AVBD_QUATERNION_HALF_FACTOR,
+              -angDelta.z * AvbdConstants::AVBD_QUATERNION_HALF_FACTOR, 1.0f);
+          bodyB.rotation = (dq * bodyB.rotation).getNormalized();
+        }
+      }
     }
   }
 }
