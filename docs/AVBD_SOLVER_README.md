@@ -1,6 +1,6 @@
 # AVBD Solver - Development Notes
 
-> **Update (2026-03-02)**: Prismatic Hessian path is integrated and standalone semantics are aligned with PhysX. Revolute is integrated in solver code path, but completion is pending SnippetJoint visual validation.
+> **Update (2026-03-07)**: D6 Unification complete ("万物皆D6"). All joint types (Spherical, Fixed, Revolute, Prismatic) unified into single D6 constraint path. Standalone algorithm fully synced with PhysX. 53/53 tests pass.
 
 Status Legend: `Integrated` = merged into main code path; `Accepted` = integrated and validated by acceptance checks; `Pending` = not complete or acceptance gate not closed.
 
@@ -19,12 +19,12 @@ AVBD (Augmented Variable Block Descent) was introduced into PhysX for the follow
 ### Roadmap
 
 ```
-Contact AL stability (DONE)           Joint Hessian integration (IN PROGRESS)
-  All non-joint objects stable      →   Spherical/Fixed/D6/Gear/Prismatic integrated
-  AVBD usable as sole solver             Revolute integrated, acceptance pending
+Contact AL stability (DONE)           D6 Unified Joint System (DONE)
+  All non-joint objects stable      →   All joints unified into D6 path
+  AVBD usable as sole solver             Spherical/Fixed/Revolute/Prismatic/D6/Gear: accepted
             ↓                                      ↓
   Lambda warm-starting (DONE)            Cloth / soft body / articulation
-  Reduce iterations → perf               Unified solver architecture
+  Reduce iterations → perf               SOA refactoring, GPU path
             ↓                                      ↓
                 Multiplayer determinism across all the above
 ```
@@ -50,18 +50,7 @@ Contact AL stability (DONE)           Joint Hessian integration (IN PROGRESS)
 
 ## Known Issues
 
-### 0. Revolute acceptance is not closed yet
-
-**Status**: Pending
-
-**Description**: Revolute rows are integrated in the local Hessian and dual update path, but SnippetJoint visual validation and full acceptance checklist are not yet closed.
-
-**Acceptance gate**:
-- SnippetJoint visual behavior matches expected hinge constraints in representative scenes.
-- No regression in mixed-joint chains (revolute + prismatic + fixed).
-- Stable dual/limit behavior under limit crossing and motor-enabled cases.
-
-### 1. Low iteration count (1x4) does not achieve stable stacking
+### 0. Low iteration count (1x4) does not achieve stable stacking
 
 **Status**: Pending
 
@@ -77,7 +66,7 @@ Contact AL stability (DONE)           Joint Hessian integration (IN PROGRESS)
 
 **Workaround**: Use outerIterations=4, innerIterations=8.
 
-### 2. Lambda warm-starting implementation details ✅
+### 1. Lambda warm-starting implementation details ✅
 
 **Status**: Accepted
 
@@ -169,7 +158,7 @@ Contact AL stability (DONE)           Joint Hessian integration (IN PROGRESS)
 
 **Known limitation**: The decay factors (`wsAlpha=0.95`, `wsGamma=0.99`) may need tuning to achieve paper-recommended 1×4 iteration stability.
 
-### 3. Documentation and implementation can drift without parity gates
+### 2. Documentation and implementation can drift without parity gates
 
 **Status**: Pending
 

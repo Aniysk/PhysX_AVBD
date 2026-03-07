@@ -11,38 +11,46 @@ Status Legend: `Integrated` = merged into main code path; `Accepted` = integrate
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Rigid Body Solver | ✅ Accepted | Contacts + unified AVBD local solve |
-| Joint System | ⚠️ Integrated | Revolute, Prismatic, Spherical, Fixed, D6, Gear (Revolute acceptance pending) |
-| Motor Drive | ⚠️ Integrated | Torque-based RevoluteJoint motor (needs scenario acceptance coverage) |
-| Joint Limits | ⚠️ Integrated | Revolute, Prismatic, Spherical cone, D6 |
-| Prismatic Hessian Path | ✅ Integrated | Position/rotation/limit rows accumulated in local Hessian |
-| Prismatic 3x3 Fallback | ✅ Accepted | Bodies touching Prismatic are forced to 6x6 local solve |
-| Standalone Alignment | ✅ Accepted | Prismatic limit sign/dual update aligned with PhysX path |
-| Regression Baseline | ✅ Accepted | Default standalone suite runs 48 aligned cases |
+| **D6 Unified Joint** | ✅ Accepted | All joint types (Spherical, Fixed, Revolute, Prismatic) unified into single D6 constraint path |
+| Joint Limits | ✅ Accepted | Revolute angle, Prismatic linear, Spherical cone, D6 per-axis |
+| Motor Drive | ✅ Accepted | Post-solve torque motor for revolute; SLERP drive for D6 |
+| Gear Joint | ✅ Accepted | Velocity-ratio constraint with post-solve motor |
+| Standalone Alignment | ✅ Accepted | PhysX and avbd_standalone share identical algorithm |
+| Regression Baseline | ✅ Accepted | Default standalone suite runs 53 aligned cases |
+| O(M) Constraint Lookup | ✅ Accepted | Eliminates O(N²) complexity |
+| Multi-threaded Islands | ✅ Accepted | Per-island constraint mappings |
+| Friction Model | ⚠️ Integrated | Coulomb approximation |
 | Custom Joint | ⏳ Pending | Custom constraint callbacks unsupported |
 | Rack & Pinion | ⏳ Pending | RackAndPinionJoint unsupported |
 | Mimic Joint | ⏳ Pending | MimicJoint unsupported |
-| O(M) Constraint Lookup | ✅ Accepted | Eliminates O(N²) complexity |
-| Multi-threaded Islands | ✅ Accepted | Per-island constraint mappings |
-| Articulation | ⏳ Pending | Currently unsupported |
+| Articulation | ⏳ Pending | Hybrid Featherstone architecture designed, not implemented |
 | Sleep / Wake | ⏳ Pending | Not implemented |
-| Friction Model | ⚠️ Integrated | Coulomb approximation |
 
 **For research and evaluation only. Not production-ready.**
 
 ## Recent Progress (2026-03)
 
-- Prismatic joint has been migrated to the AVBD Hessian path in PhysX (primal accumulation + dual multiplier update).
-- Debug defaults were cleaned up (joint debug disabled by default; named limit-flag constant used in parsing).
-- Prismatic constraint comments were aligned with implementation semantics (3 world-axis projected rows).
-- `avbd_standalone` was synchronized with PhysX behavior for prismatic limit handling and solve-path selection.
-- Default standalone regression now excludes non-PhysX baseline cases (`prismatic drive`, `prismatic 3x3 chain`).
+### D6 Unification
+
+All joint types have been unified into a single D6 constraint path. Per-type independent solvers (Spherical, Fixed, Revolute, Prismatic) have been replaced by one shared `addD6Contribution()` / `updateD6Dual()` pipeline, with joint behavior determined entirely by motion masks (LOCKED/FREE/LIMITED per DOF).
+
+Key changes:
+- **Architecture**: ~400 lines of redundant per-type constraint code removed; all joints route through unified D6 primal + dual path.
+- **Angular constraints**: Cross-product axis alignment for revolute-pattern D6 joints, replacing quaternion tangent-space error. Immune to twist-angle amplification at large rotations.
+- **Angular error**: Axis-angle decomposition (`2·acos(w)·axis`) replaces tangent-space `2·vec(errQ)`, accurate at large angles.
+- **Motor**: Post-solve torque motor decoupled from ADMM constraint Hessian, replacing in-iteration AL velocity drive.
+- **Gear joint**: Dual update moved inside ADMM iteration loop; NaN from driveForceLimit overflow fixed.
+- **Cone limit**: Per-body joint frame axes derived from `localFrameA`/`localFrameB`, replacing shared axis.
+- **Joint frames**: `localFrameB` derived from initial relative rotation at joint creation. All factory methods updated.
+- **Standalone sync**: `avbd_standalone` algorithm fully aligned with PhysX AVBD implementation.
 
 ### Current Validation Snapshot
 
-- ✅ Standalone aligned regression baseline passes (48/48 default suite).
+- ✅ Standalone regression baseline passes (53/53 suite).
+- ✅ PhysX debug build succeeds with all Snippets.
 - ✅ `SnippetChainmail` remains integrated for extreme impact and dense-joint stress regression.
-- ✅ Prismatic baseline scenes validated under Hessian path + 6x6-on-touch policy.
-- ⚠️ Revolute is integrated in solver code path, but full completion is pending SnippetJoint visual validation and acceptance checks.
+- ✅ All joint types validated: Spherical chain, breakable Fixed, damped D6, limited Prismatic, limited Revolute.
+- ✅ Gear joint stable (no NaN, no oscillation, no twist amplification).
 
 ## SnippetChainmail Demo
 
@@ -68,17 +76,15 @@ AVBD introduces a **unified position-level constraint solving framework** target
 ### Roadmap Snapshot
 
 ```
-Contact AL stability (DONE)         Joint Hessian integration (IN PROGRESS)
-	Rigid body contacts stable      ->    Spherical/Fixed/D6/Gear/Prismatic: integrated
-	AVBD usable as whole-scene solver     Revolute: integrated, acceptance pending
-						|                                    |
-	Lambda warm-starting                 Soft body / articulation / performance
-	Iteration-efficiency tuning          Unified solver architecture
-						|                                    |
-							Multiplayer determinism across all the above
+Contact AL stability (DONE)         D6 Unified Joint System (DONE)
+  Rigid body contacts stable      ->  All joints unified into D6 path
+  AVBD usable as whole-scene solver   Spherical/Fixed/Revolute/Prismatic/D6/Gear: accepted
+            |                                    |
+  Lambda warm-starting (DONE)        Soft body / articulation / performance
+  Iteration-efficiency tuning        SOA refactoring, GPU path
+            |                                    |
+                Multiplayer determinism across all the above
 ```
-
-> See [docs/AVBD_SOLVER_README.md](docs/AVBD_SOLVER_README.md) and [docs/SOLVER_ALGORITHM_ANALYSIS.md](docs/SOLVER_ALGORITHM_ANALYSIS.md) for details.
 
 ## Solver Architecture
 
@@ -107,9 +113,12 @@ For each body i:
 
 | Decision | Rationale |
 |----------|-----------|
+| **Unified D6 joint path** | All joint types (Spherical, Fixed, Revolute, Prismatic) map to a single D6 constraint with motion masks. |
+| **Cross-product axis alignment** | Revolute-pattern angular constraints use `twistA x twistB` instead of quaternion error, avoiding twist amplification. |
+| **Post-solve motor** | Motor torque applied after ADMM iterations, decoupled from constraint Hessian for stability. |
 | **Stabilized AL dual for joints** | Bounded dual step + decay (`rhoDual`, `lambdaDecay`) reduces overshoot while retaining AL memory. |
 | **Prismatic force-6x6 on touch** | Prevents instability from 3x3 decoupling under strong position-rotation coupling. |
-| **Standalone/PhysX semantic alignment** | Keep limit violation sign and dual clamp policy consistent to ensure parity. |
+| **Standalone/PhysX algorithm parity** | Both codebases share identical constraint formulation, solve pipeline, and dual update logic. |
 
 ## AVBD Solver Overview
 

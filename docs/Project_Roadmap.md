@@ -2,12 +2,12 @@
 
 - **Repository**: `VigorFox/PhysX_AVBD`
 - **Author**: Vulpes (@VigorFox)
-- **Version**: 0.3 (Prismatic Hessian + Standalone Alignment)
-- **Last Updated**: March 2, 2026
+- **Version**: 0.4 (D6 Unified Joint System)
+- **Last Updated**: March 7, 2026
 
 **Overview**: This roadmap serves as a formal guide for AI Agents (e.g., Claude, Gemini, ChatGPT) to assist in the iterative development of PhysX_AVBD. The project forks NVIDIA's PhysX SDK and integrates an experimental position-level Augmented Vertex Block Descent (AVBD) solver, with 99.9% AI-generated code. 
 **Status Legend**: `Integrated` = merged into main code path; `Accepted` = integrated and validated by acceptance checks; `Pending` = not complete or acceptance gate not closed.
-**Current status**: Prismatic/Gear are `Integrated` in PhysX Hessian path with stabilized dual updates retained. Revolute is `Integrated` in solver code path but remains `Pending` for acceptance (SnippetJoint visual validation + full checklist). Prismatic limit sign semantics and solve-path policy are `Accepted` between `physx` and `avbd_standalone` (Prismatic-touching bodies force 6x6 solve). Standalone default regression baseline is `Accepted` at 48 aligned cases.
+**Current status**: All joint types (Spherical, Fixed, Revolute, Prismatic) have been unified into a single D6 constraint path ("万物皆D6"). Gear joint is `Accepted` with post-solve motor. PhysX and avbd_standalone share identical algorithm. Standalone regression baseline is `Accepted` at 53 aligned cases. All joint types, limits, and drives are `Accepted`.
 
 The roadmap is phased, with checklists for each stage. Prioritize CPU paths, unified rigid/soft-body solving, and alignment with PhysX architecture. Use AI prompts for code generation, testing, and optimization. Track progress via GitHub issues/PRs and update X thread (ID: `2021997979444687179`) after each milestone for visibility.
 
@@ -21,15 +21,16 @@ The roadmap is phased, with checklists for each stage. Prioritize CPU paths, uni
 
 ---
 
-## Phase 1: Core Solver Unification (In Progress - Gear Integrated)
+## Phase 1: Core Solver Unification (✅ Joint System Complete)
 **Goal**: Fully unify all joint types under AVBD Hessian, eliminating fallbacks. Extend to basic soft-body constraints for CPU unified rigid/soft solving.
 
 - [x] Gear Joint unification into 6x6 Hessian (stabilized dual updates, static anchors).
 - [x] Prismatic integration into AVBD Hessian path (position/rotation/limit rows + dual updates).
-- [ ] Revolute acceptance gate: `Integrated` in Hessian path, but `Pending` SnippetJoint visual validation + full acceptance checks.
+- [x] **D6 Unification ("万物皆D6")**: All joint types (Spherical, Fixed, Revolute, Prismatic) unified into single D6 constraint path with motion masks.
+- [x] Revolute acceptance gate: Cross-product axis alignment, post-solve motor, SnippetJoint validation complete.
 - [ ] Distance joint into Hessian (full limits and drives).
-- [x] Standalone alignment with PhysX for Prismatic semantics (signed limit violation + dual clamp policy + force-6x6-on-touch).
-- [x] Regression baseline cleanup (default standalone suite: 48 aligned cases).
+- [x] Standalone alignment with PhysX: identical algorithm for all D6 joints, 53/53 tests pass.
+- [x] Regression baseline: 53 aligned cases covering all joint types, limits, drives, gear, and stability.
 - [ ] CPU Soft-Body Support:
   - Implement tetrahedral/triangular constraints (distance, volume, bending).
   - Create `PxAVBDSoftBody` actor (CPU host memory path).

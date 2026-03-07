@@ -1,8 +1,8 @@
 # AVBD Solver Algorithm Analysis
 
-> **Analysis Date**: March 2, 2026  
+> **Analysis Date**: March 7, 2026  
 > **Author**: Code review and reverse engineering  
-> **Status**: Accepted (state-aligned as of current implementation)
+> **Status**: Accepted (D6 Unification complete)
 
 Status Legend: `Integrated` = merged into main code path; `Accepted` = integrated and validated by acceptance checks; `Pending` = not complete or acceptance gate not closed.
 
@@ -10,11 +10,11 @@ Status Legend: `Integrated` = merged into main code path; `Accepted` = integrate
 
 The current PhysX_AVBD path is a **unified AL + local Hessian solve** framework:
 
-1. **Primal step**: per-body local system accumulates contacts and supported joint rows into a local matrix/RHS.
+1. **Primal step**: per-body local system accumulates contacts and D6 joint rows into a local matrix/RHS.
 2. **Local solve**: 3x3 decoupled or 6x6 coupled solve depending on runtime policy.
 3. **Dual step**: multipliers are updated with stabilized `rhoDual` and decay.
 
-Compared with the older state, **Prismatic is now integrated into Hessian accumulation**, and prismatic-touching bodies are forced to 6x6 local solve for stability. Revolute rows are integrated in the solver path as well, but completion should be treated as **acceptance-pending** until SnippetJoint visual verification is closed.
+All joint types (Spherical, Fixed, Revolute, Prismatic) have been **unified into a single D6 constraint path** ("万物皆D6"). Per-type solvers have been removed; joint behavior is determined entirely by per-DOF motion masks (LOCKED/FREE/LIMITED). Both PhysX and avbd_standalone share the same algorithm.
 
 ---
 
@@ -56,14 +56,22 @@ This means the practical behavior is **hybrid by policy**: mostly 3x3 where safe
 
 | Joint Type | Primal (Hessian/RHS) | Dual Update | Acceptance Status |
 |------------|----------------------|-------------|-------------------|
-| Spherical  | Integrated | Integrated | Accepted |
-| Fixed      | Integrated | Integrated | Accepted |
-| D6         | Integrated | Integrated | Accepted (with scene-dependent tuning) |
-| Gear       | Integrated | Integrated | Accepted |
-| Prismatic  | Integrated (pos/rot/limit) | Integrated (signed limit clamp) | Accepted |
-| Revolute   | Integrated in code path | Integrated | **Pending visual acceptance** |
+| Spherical  | Unified D6 path | Unified D6 path | Accepted |
+| Fixed      | Unified D6 path | Unified D6 path | Accepted |
+| D6         | Unified D6 path | Unified D6 path | Accepted |
+| Gear       | Velocity-ratio + post-solve motor | Inside iteration loop | Accepted |
+| Prismatic  | Unified D6 path (pos/rot/limit) | Unified D6 path (signed limit clamp) | Accepted |
+| Revolute   | Unified D6 path (cross-product axis alignment) | Unified D6 path | Accepted |
 
-Note: “integrated” != “fully accepted.” Acceptance must include scenario-level validation, not only code-path presence.
+All joint types share one `addD6Contribution()` primal function and one `updateD6Dual()` dual function. The per-type behavior (which DOFs are constrained, limited, or free) is configured via `linearMotion`/`angularMotion` masks at joint creation time.
+
+### Key Algorithmic Choices
+
+- **Revolute angular constraint**: Cross-product axis alignment (`worldTwistA × worldTwistB`) projected onto perpendicular swing basis. Immune to twist-angle amplification.
+- **Angular error computation**: Axis-angle decomposition (`2·acos(w)·axis`), accurate at large angles.
+- **Motor drive**: Post-solve torque application after all ADMM iterations, decoupled from constraint Hessian.
+- **Cone limit**: Per-body joint frame X-axis (`rotA * localFrameA` / `rotB * localFrameB`), not shared world axis.
+- **Joint frames**: `localFrameB` derived from initial relative rotation at creation; both primal and dual use per-body frames.
 
 ---
 
@@ -97,16 +105,17 @@ These are healthy as long as they remain measurable and regression-gated.
 
 ## 6. Recommended Next Steps
 
-1. Close Revolute acceptance with SnippetJoint visual checklist.
-2. Add parity harness for mixed-joint chains (revolute + prismatic + fixed).
+1. Add Distance joint to unified D6 path.
+2. Implement hybrid Featherstone architecture for articulation support.
 3. Continue low-iteration convergence tuning (toward paper-style 1x4 targets).
-4. Keep architecture documentation synchronized with code comments and regression outputs.
+4. SOA refactoring for cache efficiency and GPU-readiness.
+5. Add numerical precision regression tests (compare against analytical solutions).
 
 ---
 
 ## 7. Conclusion
 
-The solver is no longer accurately described as “3x3 + GS fallback” only. The current state is a **unified AVBD-style AL framework with local Hessian accumulation**, runtime path selection (3x3/6x6), and explicit stabilization policies. This is a sound engineering trajectory, provided acceptance gates and parity tests remain first-class.
+The solver is a **unified AVBD-style AL framework with single D6 constraint path**, runtime path selection (3x3/6x6), and explicit stabilization policies. All joint types route through the same primal/dual pipeline. The D6 unification eliminates per-type code duplication, reduces maintenance surface, and ensures algorithmic improvements benefit all joint types simultaneously. PhysX and avbd_standalone implementations are fully aligned.
 
 ---
 
