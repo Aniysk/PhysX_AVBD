@@ -167,13 +167,15 @@ sceneDesc.solverType = PxSolverType::eAVBD;
 
 ```
 physx/source/lowleveldynamics/src/
-├── DyAvbdSolver.h/cpp       # Core solver
-├── DyAvbdDynamics.h/cpp     # PhysX integration
-├── DyAvbdTasks.h/cpp        # Multi-threading
-├── DyAvbdTypes.h            # Config & data structures
-├── DyAvbdConstraint.h       # Constraint definitions
-├── DyAvbdJointSolver.h/cpp  # Joint solving
-└── DyAvbdSolverBody.h       # Body state
+├── DyAvbdSolver.h/cpp            # Core solver (contact-only path)
+├── DyAvbdSolverJointPath.cpp     # Solver joint path (solveWithJoints entry)
+├── DyAvbdJointProjection.h/cpp   # Per-joint-type constraint projection & multiplier update
+├── DyAvbdDynamics.h/cpp          # PhysX integration & frame orchestration
+├── DyAvbdDynamicsPrep.cpp        # Contact & joint constraint preparation
+├── DyAvbdTasks.h/cpp             # Multi-threading
+├── DyAvbdTypes.h                 # Config & data structures
+├── DyAvbdConstraint.h            # Constraint definitions
+└── DyAvbdSolverBody.h/cpp        # Body state
 ```
 
 ## Profiling

@@ -24,7 +24,7 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-#include "DyAvbdJointSolver.h"
+#include "DyAvbdJointProjection.h"
 #include "foundation/PxMath.h"
 
 namespace physx {

@@ -80,11 +80,13 @@ SET(LLDYNAMICS_SOURCE
 	${LLDYNAMICS_BASE_DIR}/src/DyAvbdContactPrep.h
 	${LLDYNAMICS_BASE_DIR}/src/DyAvbdDynamics.cpp
 	${LLDYNAMICS_BASE_DIR}/src/DyAvbdDynamics.h
-	${LLDYNAMICS_BASE_DIR}/src/DyAvbdJointSolver.cpp
-	${LLDYNAMICS_BASE_DIR}/src/DyAvbdJointSolver.h
+	${LLDYNAMICS_BASE_DIR}/src/DyAvbdDynamicsPrep.cpp
+	${LLDYNAMICS_BASE_DIR}/src/DyAvbdJointProjection.cpp
+	${LLDYNAMICS_BASE_DIR}/src/DyAvbdJointProjection.h
 	${LLDYNAMICS_BASE_DIR}/src/DyAvbdParallel.h
 	${LLDYNAMICS_BASE_DIR}/src/DyAvbdSolver.cpp
 	${LLDYNAMICS_BASE_DIR}/src/DyAvbdSolver.h
+	${LLDYNAMICS_BASE_DIR}/src/DyAvbdSolverJointPath.cpp
 	${LLDYNAMICS_BASE_DIR}/src/DyAvbdSolverBody.cpp
 	${LLDYNAMICS_BASE_DIR}/src/DyAvbdSolverBody.h
 	${LLDYNAMICS_BASE_DIR}/src/DyAvbdTasks.cpp

@@ -24,8 +24,8 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-#ifndef DY_AVBD_JOINT_SOLVER_H
-#define DY_AVBD_JOINT_SOLVER_H
+#ifndef DY_AVBD_JOINT_PROJECTION_H
+#define DY_AVBD_JOINT_PROJECTION_H
 
 #include "DyAvbdConstraint.h"
 #include "DyAvbdSolverBody.h"
@@ -162,4 +162,4 @@ PX_FORCE_INLINE physx::PxMat33 skewMatrix(const physx::PxVec3 &v) {
 } // namespace Dy
 } // namespace physx
 
-#endif // DY_AVBD_JOINT_SOLVER_H
+#endif // DY_AVBD_JOINT_PROJECTION_H
