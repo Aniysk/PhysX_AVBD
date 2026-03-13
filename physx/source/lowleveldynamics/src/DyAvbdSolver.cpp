@@ -243,8 +243,19 @@ void AvbdSolver::solve(physx::PxReal dt, AvbdSolverBody *bodies,
               ? bodies[bB].prevPosition +
                     bodies[bB].prevRotation.rotate(contacts[c].contactPointB)
               : contacts[c].contactPointB;
-      contacts[c].C0 = (wA - wB).dot(contacts[c].contactNormal) +
+      physx::PxReal rawC0 = (wA - wB).dot(contacts[c].contactNormal) +
                        contacts[c].penetrationDepth;
+
+      // Depth-adaptive C0 clamping: for deep penetrations (fast impacts),
+      // reduce C0 so that alpha blending does not over-soften the correction.
+      const physx::PxReal c0Threshold = 0.05f;  // 50 mm
+      const physx::PxReal c0MaxDepth  = 0.20f;  // 200 mm
+      if (rawC0 < -c0Threshold) {
+        physx::PxReal t = PxClamp(
+            (c0MaxDepth + rawC0) / (c0MaxDepth - c0Threshold), 0.0f, 1.0f);
+        rawC0 *= t;
+      }
+      contacts[c].C0 = rawC0;
     }
   }
 
@@ -2218,8 +2229,18 @@ void AvbdSolver::solveWithJoints(
               ? bodies[bB].prevPosition +
                     bodies[bB].prevRotation.rotate(contacts[c].contactPointB)
               : contacts[c].contactPointB;
-      contacts[c].C0 = (wA - wB).dot(contacts[c].contactNormal) +
+      physx::PxReal rawC0 = (wA - wB).dot(contacts[c].contactNormal) +
                        contacts[c].penetrationDepth;
+
+      // Depth-adaptive C0 clamping (same as solve() path)
+      const physx::PxReal c0Threshold = 0.05f;
+      const physx::PxReal c0MaxDepth  = 0.20f;
+      if (rawC0 < -c0Threshold) {
+        physx::PxReal t = PxClamp(
+            (c0MaxDepth + rawC0) / (c0MaxDepth - c0Threshold), 0.0f, 1.0f);
+        rawC0 *= t;
+      }
+      contacts[c].C0 = rawC0;
     }
   }
 
