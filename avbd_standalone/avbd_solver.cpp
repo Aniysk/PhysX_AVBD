@@ -362,7 +362,20 @@ void Solver::computeC0(Contact &c) {
   Vec3 wA = bA.position + bA.rotation.rotate(c.rA);
   Vec3 wB = bStatic ? c.rB : (pB->position + pB->rotation.rotate(c.rB));
 
-  c.C0[0] = (wA - wB).dot(c.normal) - c.depth;
+  float rawC0 = (wA - wB).dot(c.normal) - c.depth;
+
+  // Depth-adaptive C0 clamping: for deep penetrations (fast impacts),
+  // reduce C0 so that alpha blending does not over-soften the correction.
+  // Shallow contacts keep C0 unchanged; deep ones fade C0 toward zero.
+  const float c0Threshold = 0.05f;  // 50 mm: only trigger on fast impacts
+  const float c0MaxDepth  = 0.20f;  // 200 mm: full fade-out
+  if (rawC0 < -c0Threshold) {
+    float t = std::clamp(
+        (c0MaxDepth + rawC0) / (c0MaxDepth - c0Threshold), 0.0f, 1.0f);
+    rawC0 *= t;
+  }
+
+  c.C0[0] = rawC0;
   c.C0[1] = 0.0f;
   c.C0[2] = 0.0f;
 }
