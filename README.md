@@ -16,19 +16,30 @@ Status Legend: `Integrated` = merged into main code path; `Accepted` = integrate
 | Motor Drive | ✅ Accepted | Post-solve torque motor for revolute; SLERP drive for D6 |
 | Gear Joint | ✅ Accepted | Velocity-ratio constraint with post-solve motor |
 | Standalone Alignment | ✅ Accepted | PhysX and avbd_standalone share identical algorithm |
-| Regression Baseline | ✅ Accepted | Default standalone suite runs 71 aligned cases (53 core + 18 friction) |
+| Regression Baseline | ✅ Accepted | Standalone: 99/99; PhysX: 29/29 articulation tests |
 | O(M) Constraint Lookup | ✅ Accepted | Eliminates O(N²) complexity |
 | Multi-threaded Islands | ✅ Accepted | Per-island constraint mappings |
 | Friction Model | ✅ Accepted | Coulomb cone, per-material coefficients from PxContactPatch |
 | Custom Joint | ⏳ Pending | Custom constraint callbacks unsupported |
 | Rack & Pinion | ⏳ Pending | RackAndPinionJoint unsupported |
 | Mimic Joint | ⏳ Pending | MimicJoint unsupported |
-| Articulation | ⏳ Pending | Hybrid Featherstone architecture designed, not implemented |
+| Articulation | ✅ Accepted | Pure AVBD penalty-based, 29/29 tests, per-island iterations |
 | Sleep / Wake | ⏳ Pending | Not implemented |
 
 **For research and evaluation only. Not production-ready.**
 
 ## Recent Progress (2026-03)
+
+### Articulation Solver (NEW)
+
+Articulation support is now fully implemented using a **pure AVBD penalty-based architecture** — no Featherstone dependency. All articulation internal joints are solved as AL constraint rows in the same block descent loop as contacts and external D6 joints.
+
+Key achievements:
+- **29/29 PhysX tests pass** including scissor lift with closed kinematic loops, loaded boxes, and 10s stability.
+- **12 bugs fixed** during integration: motion encoding (2-bit-per-axis), position drive error computation, eFIX penalty boost, iteration count byte order, and more.
+- **Per-island adaptive iterations**: Articulations use `setSolverIterationCounts(N)` for higher iteration budgets; contact-only islands default to 8 iterations.
+- **Exceeds Featherstone hybrid ceiling**: The alternating-solve lag in Featherstone coupling was the dominant error source for strongly coupled systems. Unified penalty solving eliminates this boundary.
+- **Standalone**: 99/99 tests including convergence acceleration (Anderson Acceleration 47%, Chebyshev 29%), ID extraction via λ*, solver-is-IK, mimic joints.
 
 ### D6 Unification
 
@@ -55,12 +66,15 @@ Key changes:
 
 ### Current Validation Snapshot
 
-- ✅ Standalone regression baseline passes (71/71 suite: 53 core + 18 friction).
+- ✅ Standalone regression baseline passes (99/99 suite).
+- ✅ PhysX articulation regression passes (29/29 tests, 15 consecutive deterministic runs).
 - ✅ PhysX debug build succeeds with all Snippets.
 - ✅ `SnippetChainmail` remains integrated for extreme impact and dense-joint stress regression.
 - ✅ All joint types validated: Spherical chain, breakable Fixed, damped D6, limited Prismatic, limited Revolute.
 - ✅ Gear joint stable (no NaN, no oscillation, no twist amplification).
-- ✅ Friction reads per-material coefficients; Coulomb cone + augmented Lagrangian validated in standalone.
+- ✅ Friction reads per-material coefficients; Coulomb cone + augmented Lagrangian validated.
+- ✅ Scissor lift with closed kinematic loops and loaded boxes: stable 10s.
+- ✅ Per-island adaptive iteration override: articulations get high iterations, contacts get low.
 
 ## SnippetChainmail Demo
 
@@ -90,10 +104,12 @@ Contact AL stability (DONE)         D6 Unified Joint System (DONE)
   Rigid body contacts stable      ->  All joints unified into D6 path
   AVBD usable as whole-scene solver   Spherical/Fixed/Revolute/Prismatic/D6/Gear: accepted
             |                                    |
-  Lambda warm-starting (DONE)        Soft body / articulation / performance
-  Iteration-efficiency tuning        SOA refactoring, GPU path
+  Lambda warm-starting (DONE)        Articulation Solver (DONE)
+  Iteration-efficiency tuning        Pure AVBD penalty-based, 29/29 PhysX tests
+            |                        Per-island adaptive iterations
             |                                    |
-                Multiplayer determinism across all the above
+                Soft body / performance / GPU path
+                SOA refactoring, multiplayer determinism
 ```
 
 ## Solver Architecture
@@ -188,9 +204,9 @@ PVD Profile Zones available:
 
 ## Known Limitations
 
-1. **No Articulation support** - Articulated bodies not implemented
-2. **No Sleep/Wake** - Bodies remain active
-3. **CPU only** - No GPU acceleration
+1. **No Sleep/Wake** - Bodies remain active
+2. **CPU only** - No GPU acceleration
+3. **Articulation cold-start** - Long open chains (N>20) need higher iteration counts for cold-start convergence
 
 ## Original PhysX Documentation
 

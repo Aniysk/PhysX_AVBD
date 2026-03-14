@@ -45,6 +45,19 @@
 using namespace physx;
 using namespace physx::Dy;
 
+static PxU32 findArticulationLinkIndex(FeatherstoneArticulation *articulation,
+                                       const PxsRigidCore *rigidCore) {
+  if (!articulation || !rigidCore)
+    return PX_MAX_U32;
+  ArticulationData &artData = articulation->getArticulationData();
+  const PxU32 linkCount = artData.getLinkCount();
+  for (PxU32 linkIdx = 0; linkIdx < linkCount; ++linkIdx) {
+    if (artData.getLink(linkIdx).bodyCore == rigidCore)
+      return linkIdx;
+  }
+  return PX_MAX_U32;
+}
+
 #ifndef AVBD_JOINT_DEBUG
 #define AVBD_JOINT_DEBUG 0
 #endif
@@ -265,10 +278,14 @@ PxU32 AvbdDynamicsContext::prepareAvbdContacts(
     const PxU32 npIndex = cm->getWorkUnit().mNpIndex;
     PxsContactManagerOutput &output =
         mOutputIterator.getContactManagerOutput(npIndex);
+
     if (output.nbContacts == 0)
       continue;
-    if (!(output.statusFlag & PxsContactManagerStatusFlag::eHAS_TOUCH))
-      continue;
+    // NOTE: Do NOT filter by eHAS_TOUCH here. AVBD is a position-based solver
+    // that predicts positions (gravity warmstart) before solving. Near-miss
+    // contacts (separation > 0, eHAS_TOUCH=false) are essential: without them,
+    // the solver has no constraint to prevent predicted positions from
+    // penetrating static geometry, causing bodies to fall through the ground.
 
     AvbdSolverBody *bodyA = (localBody0Idx < islandBodyCount)
                                 ? &avbdBodies[localBody0Idx]
@@ -426,10 +443,16 @@ void AvbdDynamicsContext::prepareAvbdConstraints(
     PxU32 islandBodyCount, PxU32 bodyOffset,
     AvbdD6JointConstraint *d6Constraints, PxU32 &numD6, PxU32 maxD6,
     AvbdGearJointConstraint *gearConstraints, PxU32 &numGear, PxU32 maxGear,
-    PxU32 islandIndex, PxU32 *bodyRemapTable) {
+    PxU32 islandIndex, PxU32 *bodyRemapTable,
+    PxU32 *articulationFirstLinkIndex,
+    FeatherstoneArticulation **articulationByActiveIdx,
+    PxU32 numArticulations) {
 
   PX_UNUSED(avbdBodies);
   PX_UNUSED(islandBodyCount);
+
+  const PxU32 numDynamicBodies =
+      islandSim.getNbActiveNodes(IG::Node::eRIGID_BODY_TYPE);
 
   const IG::Island &island =
       islandSim.getIsland(islandSim.getActiveIslands()[islandIndex]);
@@ -465,8 +488,25 @@ void AvbdDynamicsContext::prepareAvbdConstraints(
       if (!body0IsStatic) {
         if (!nodeIndex0.isStaticBody()) {
           const PxU32 activeIdx = islandSim.getActiveNodeIndex(nodeIndex0);
-          if (bodyRemapTable[activeIdx] != PX_MAX_U32) {
-            localBody0 = bodyRemapTable[activeIdx] - bodyOffset;
+          const IG::Node &node0 = islandSim.getNode(nodeIndex0);
+          const bool isArt0 =
+              node0.getNodeType() == IG::Node::eARTICULATION_TYPE;
+          const PxU32 remapIdx0 =
+              isArt0 ? (numDynamicBodies + activeIdx) : activeIdx;
+          if (bodyRemapTable[remapIdx0] != PX_MAX_U32) {
+            localBody0 = bodyRemapTable[remapIdx0] - bodyOffset;
+            // For articulation nodes, bodyRemapTable points to the first link.
+            // Resolve the specific link via bodyCore matching.
+            if (isArt0 &&
+                articulationByActiveIdx && articulationFirstLinkIndex &&
+                activeIdx < numArticulations + 1 &&
+                articulationByActiveIdx[activeIdx] && constraint->bodyCore0) {
+              PxU32 linkIdx = findArticulationLinkIndex(
+                  articulationByActiveIdx[activeIdx], constraint->bodyCore0);
+              if (linkIdx != PX_MAX_U32) {
+                localBody0 = articulationFirstLinkIndex[activeIdx] - bodyOffset + linkIdx;
+              }
+            }
           }
         }
       }
@@ -474,8 +514,24 @@ void AvbdDynamicsContext::prepareAvbdConstraints(
       if (!body1IsStatic) {
         if (!nodeIndex1.isStaticBody()) {
           const PxU32 activeIdx = islandSim.getActiveNodeIndex(nodeIndex1);
-          if (bodyRemapTable[activeIdx] != PX_MAX_U32) {
-            localBody1 = bodyRemapTable[activeIdx] - bodyOffset;
+          const IG::Node &node1 = islandSim.getNode(nodeIndex1);
+          const bool isArt1 =
+              node1.getNodeType() == IG::Node::eARTICULATION_TYPE;
+          const PxU32 remapIdx1 =
+              isArt1 ? (numDynamicBodies + activeIdx) : activeIdx;
+          if (bodyRemapTable[remapIdx1] != PX_MAX_U32) {
+            localBody1 = bodyRemapTable[remapIdx1] - bodyOffset;
+            // For articulation nodes, resolve specific link via bodyCore.
+            if (isArt1 &&
+                articulationByActiveIdx && articulationFirstLinkIndex &&
+                activeIdx < numArticulations + 1 &&
+                articulationByActiveIdx[activeIdx] && constraint->bodyCore1) {
+              PxU32 linkIdx = findArticulationLinkIndex(
+                  articulationByActiveIdx[activeIdx], constraint->bodyCore1);
+              if (linkIdx != PX_MAX_U32) {
+                localBody1 = articulationFirstLinkIndex[activeIdx] - bodyOffset + linkIdx;
+              }
+            }
           }
         }
       }

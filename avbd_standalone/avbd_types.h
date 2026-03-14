@@ -25,6 +25,11 @@ struct Body {
   float friction;
   Vec3 halfExtent; // box half-extents (for collision queries)
 
+  float linearDamping = 0.0f;
+  float angularDamping = 0.0f;
+  float maxLinearVelocity = 1e6f;
+  float maxAngularVelocity = 1e6f;
+
   // Derived (computed at init)
   float invMass;
   Mat33 invInertiaWorld; // inverse inertia in world frame

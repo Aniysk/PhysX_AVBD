@@ -72,7 +72,8 @@ physx::PxU64 getAvbdMotorFrameCounter() { return gAvbdMotorFrameCounter; }
 static void prepareArticulationInternalJoints(
     FeatherstoneArticulation *articulation, PxU32 firstBodyIndex,
     AvbdD6JointConstraint *d6Constraints, PxU32 &numD6, PxU32 maxD6,
-    AvbdGearJointConstraint *gearConstraints, PxU32 &numGear, PxU32 maxGear);
+    AvbdGearJointConstraint *gearConstraints, PxU32 &numGear, PxU32 maxGear,
+    PxReal dt = 1.0f / 60.0f);
 
 //=============================================================================
 // Helper function to find articulation link index from rigid core
@@ -304,7 +305,7 @@ void AvbdDynamicsContext::update(
   }
 
   // Calculate total body count including articulation links
-  PxU32 totalBodyCount = numDynamicBodies + maxArticulationLinks;
+  PxU32 totalBodyCount = numDynamicBodies + numArticulations * maxArticulationLinks;
 
   // Allocate global arrays - use scratch with main allocator fallback
   AvbdSolverBody *avbdBodies = nullptr;
@@ -462,6 +463,12 @@ void AvbdDynamicsContext::update(
               solverBody.nodeIndex = bodyIndex;
               solverBody.colorGroup = 0;
 
+              // Copy per-body damping and velocity caps from body core
+              solverBody.linearDamping = bodyCore->linearDamping;
+              solverBody.angularDampingBody = bodyCore->angularDamping;
+              solverBody.maxLinearVelocitySq = bodyCore->maxLinearVelocitySq;
+              solverBody.maxAngularVelocitySq = bodyCore->maxAngularVelocitySq;
+
               // Store for writeback
               if (articulationForBody && linkIndexForBody) {
                 articulationForBody[bodyIndex] = articulation;
@@ -480,8 +487,11 @@ void AvbdDynamicsContext::update(
           // Count internal articulation joints
           info.articulationJointCount += (linkCount > 1) ? (linkCount - 1) : 0;
 
-          if (activeNodeIdx < maxActiveNodes && articulationFirstLinkIndex) {
-            bodyRemapTable[activeNodeIdx] =
+          // Offset articulation active index by numDynamicBodies to avoid
+          // namespace collision -- getActiveNodeIndex() returns per-TYPE indices
+          const PxU32 artRemapIdx = numDynamicBodies + activeNodeIdx;
+          if (artRemapIdx < maxActiveNodes && articulationFirstLinkIndex) {
+            bodyRemapTable[artRemapIdx] =
                 articulationFirstLinkIndex[activeNodeIdx];
           }
         }
@@ -524,10 +534,12 @@ void AvbdDynamicsContext::update(
         // Set up body0
         if (!nodeIndex1.isStaticBody()) {
           const PxU32 activeIdx = islandSim.getActiveNodeIndex(nodeIndex1);
-          if (activeIdx < maxActiveNodes &&
-              bodyRemapTable[activeIdx] != PX_MAX_U32) {
+          const bool isArt0 = (workUnit.mFlags & PxcNpWorkUnitFlag::eARTICULATION_BODY0) != 0;
+          const PxU32 remapIdx0 = isArt0 ? (numDynamicBodies + activeIdx) : activeIdx;
+          if (remapIdx0 < maxActiveNodes &&
+              bodyRemapTable[remapIdx0] != PX_MAX_U32) {
             // Check if this is an articulation link
-            if ((workUnit.mFlags & PxcNpWorkUnitFlag::eARTICULATION_BODY0) &&
+            if (isArt0 &&
                 articulationByActiveIdx && articulationFirstLinkIndex &&
                 activeIdx < numArticulations + 1) {
               // Find the actual link index for this contact
@@ -542,11 +554,11 @@ void AvbdDynamicsContext::update(
               } else {
                 // Fallback to first link if not found
                 icm.indexType0 = PxsIndexedInteraction::eBODY;
-                icm.solverBody0 = bodyRemapTable[activeIdx];
+                icm.solverBody0 = bodyRemapTable[remapIdx0];
               }
             } else {
               icm.indexType0 = PxsIndexedInteraction::eBODY;
-              icm.solverBody0 = bodyRemapTable[activeIdx];
+              icm.solverBody0 = bodyRemapTable[remapIdx0];
             }
           } else {
             icm.indexType0 = PxsIndexedInteraction::eWORLD;
@@ -563,10 +575,12 @@ void AvbdDynamicsContext::update(
           icm.solverBody1 = 0;
         } else {
           const PxU32 activeIdx = islandSim.getActiveNodeIndex(nodeIndex2);
-          if (activeIdx < maxActiveNodes &&
-              bodyRemapTable[activeIdx] != PX_MAX_U32) {
+          const bool isArt1 = (workUnit.mFlags & PxcNpWorkUnitFlag::eARTICULATION_BODY1) != 0;
+          const PxU32 remapIdx1 = isArt1 ? (numDynamicBodies + activeIdx) : activeIdx;
+          if (remapIdx1 < maxActiveNodes &&
+              bodyRemapTable[remapIdx1] != PX_MAX_U32) {
             // Check if this is an articulation link
-            if ((workUnit.mFlags & PxcNpWorkUnitFlag::eARTICULATION_BODY1) &&
+            if (isArt1 &&
                 articulationByActiveIdx && articulationFirstLinkIndex &&
                 activeIdx < numArticulations + 1) {
               // Find the actual link index for this contact
@@ -581,11 +595,11 @@ void AvbdDynamicsContext::update(
               } else {
                 // Fallback to first link if not found
                 icm.indexType1 = PxsIndexedInteraction::eBODY;
-                icm.solverBody1 = bodyRemapTable[activeIdx];
+                icm.solverBody1 = bodyRemapTable[remapIdx1];
               }
             } else {
               icm.indexType1 = PxsIndexedInteraction::eBODY;
-              icm.solverBody1 = bodyRemapTable[activeIdx];
+              icm.solverBody1 = bodyRemapTable[remapIdx1];
             }
           } else {
             icm.indexType1 = PxsIndexedInteraction::eWORLD;
@@ -616,7 +630,7 @@ void AvbdDynamicsContext::update(
   if (!mSolverInitialized && mAllocatorCallback) {
     AvbdSolverConfig config;
     config.outerIterations = 1;
-    config.innerIterations = 4; // Ref AVBD3D uses iterations=10
+    config.innerIterations = 4; // Default for contact-only islands; articulations use per-body overrides
     config.initialRho = AvbdConstants::AVBD_DEFAULT_PENALTY_RHO_HIGH;
     config.maxRho = AvbdConstants::AVBD_MAX_PENALTY_RHO;
     config.enableLocal6x6Solve = true;
@@ -705,10 +719,13 @@ void AvbdDynamicsContext::update(
           islandSim, &avbdBodies[info.bodyStart], info.bodyCount,
           info.bodyStart, d6Joints + currD6Idx, numD6,
           totalJointCapacity - currD6Idx, gearJoints + currGearIdx, numGear,
-          totalJointCapacity - currGearIdx, i, bodyRemapTable);
+          totalJointCapacity - currGearIdx, i, bodyRemapTable,
+          articulationFirstLinkIndex, articulationByActiveIdx,
+          numArticulations);
     }
 
     // Prepare articulation internal joints
+    PxU32 islandArticIterations = 0; // max per-articulation iteration count
     if (info.articulationJointCount > 0 && articulationFirstLinkIndex) {
       const IG::Island &island = islandSim.getIsland(islandIds[i]);
       PxNodeIndex currentNodeIndex = island.mRootNode;
@@ -722,6 +739,13 @@ void AvbdDynamicsContext::update(
                   currentNodeIndex, IG::Node::eARTICULATION_TYPE));
 
           if (articulation) {
+            // Read per-articulation position iteration count (low byte)
+            // Format: high byte = velocityIters, low byte = positionIters
+            const PxU16 iterWord = articulation->getIterationCounts();
+            const PxU32 posIters = iterWord & 0xFF;
+            if (posIters > islandArticIterations)
+              islandArticIterations = posIters;
+
             const PxU32 activeNodeIdx =
                 islandSim.getActiveNodeIndex(currentNodeIndex);
             PxU32 artFirstBodyIdx = PX_MAX_U32;
@@ -740,7 +764,8 @@ void AvbdDynamicsContext::update(
                   d6Joints + currD6Idx + numD6, artD6,
                   totalJointCapacity - currD6Idx - numD6,
                   gearJoints + currGearIdx + numGear, artGear,
-                  totalJointCapacity - currGearIdx - numGear);
+                  totalJointCapacity - currGearIdx - numGear,
+                  dt);
 
               numD6 += artD6;
               numGear += artGear;
@@ -772,6 +797,7 @@ void AvbdDynamicsContext::update(
 
     batch.islandStart = i;
     batch.islandEnd = i + 1;
+    batch.iterationOverride = islandArticIterations;
     batch.colorBatches = nullptr;
     batch.numColors = 0;
 
@@ -869,11 +895,12 @@ void AvbdDynamicsContext::update(
             batch.numConstraints, batch.d6Joints, batch.numD6,
             batch.gearJoints, batch.numGear, gravity, &batch.contactMap,
             &batch.d6Map, &batch.gearMap, batch.colorBatches,
-            batch.numColors);
+            batch.numColors, batch.iterationOverride);
       } else {
         mSolver.solve(dt, batch.bodies, batch.numBodies, batch.constraints,
                       batch.numConstraints, gravity, &batch.contactMap,
-                      batch.colorBatches, batch.numColors);
+                      batch.colorBatches, batch.numColors,
+                      batch.iterationOverride);
       }
       // Write back lambda cache inline
       writeLambdaToCache(*this, batch.constraints, batch.numConstraints);
@@ -947,7 +974,8 @@ void AvbdDynamicsContext::writeBackBodies(AvbdSolverBody *avbdBodies,
 static void prepareArticulationInternalJoints(
     FeatherstoneArticulation *articulation, PxU32 firstBodyIndex,
     AvbdD6JointConstraint *d6Constraints, PxU32 &numD6, PxU32 maxD6,
-    AvbdGearJointConstraint *gearConstraints, PxU32 &numGear, PxU32 maxGear) {
+    AvbdGearJointConstraint *gearConstraints, PxU32 &numGear, PxU32 maxGear,
+    PxReal dt) {
 
   PX_UNUSED(gearConstraints);
   PX_UNUSED(maxGear);
@@ -993,7 +1021,18 @@ static void prepareArticulationInternalJoints(
 
       c.header.bodyIndexA = bodyIndexA;
       c.header.bodyIndexB = bodyIndexB;
-      c.header.rho = AvbdConstants::AVBD_DEFAULT_PENALTY_RHO_HIGH * 2.0f;
+
+      // Use mass-proportional rho to avoid overwhelming contact penalties.
+      // With fixed rho=2e6 and contact penalty ~m/h^2, the 100:1 imbalance
+      // causes block-descent to ignore contacts, leading to base drift.
+      const PxReal artInvDt = (dt > 0.0f) ? (1.0f / dt) : 60.0f;
+      const PxReal artInvDt2 = artInvDt * artInvDt;
+      const PxReal massA_art = parentBodyCore->inverseMass > 0.0f
+          ? 1.0f / parentBodyCore->inverseMass : 100.0f;
+      const PxReal massB_art = childBodyCore->inverseMass > 0.0f
+          ? 1.0f / childBodyCore->inverseMass : 100.0f;
+      const PxReal massMax = PxMax(massA_art, massB_art);
+      c.header.rho = PxMax(10.0f * massMax * artInvDt2, 1e5f);
       c.header.compliance = 0.0f;
       c.header.damping = AvbdConstants::AVBD_CONSTRAINT_DAMPING;
 
@@ -1004,16 +1043,27 @@ static void prepareArticulationInternalJoints(
       c.localFrameB = jointCore->childPose.q;
 
       // Translate articulation motion limits to D6 limit bits
+      // 2-bit-per-axis encoding: bits[1:0]=axisX, bits[3:2]=axisY,
+      // bits[5:4]=axisZ.  Values: 0=LOCKED, 1=LIMITED, 2=FREE.
       c.linearMotion = 0;
-      if (jointCore->motion[PxArticulationAxis::eX] !=
-          PxArticulationMotion::eLOCKED)
-        c.linearMotion |= 1;
-      if (jointCore->motion[PxArticulationAxis::eY] !=
-          PxArticulationMotion::eLOCKED)
-        c.linearMotion |= 2;
-      if (jointCore->motion[PxArticulationAxis::eZ] !=
-          PxArticulationMotion::eLOCKED)
-        c.linearMotion |= 4;
+      if (jointCore->motion[PxArticulationAxis::eX] ==
+          PxArticulationMotion::eLIMITED)
+        c.linearMotion |= (1u << 0);
+      else if (jointCore->motion[PxArticulationAxis::eX] ==
+               PxArticulationMotion::eFREE)
+        c.linearMotion |= (2u << 0);
+      if (jointCore->motion[PxArticulationAxis::eY] ==
+          PxArticulationMotion::eLIMITED)
+        c.linearMotion |= (1u << 2);
+      else if (jointCore->motion[PxArticulationAxis::eY] ==
+               PxArticulationMotion::eFREE)
+        c.linearMotion |= (2u << 2);
+      if (jointCore->motion[PxArticulationAxis::eZ] ==
+          PxArticulationMotion::eLIMITED)
+        c.linearMotion |= (1u << 4);
+      else if (jointCore->motion[PxArticulationAxis::eZ] ==
+               PxArticulationMotion::eFREE)
+        c.linearMotion |= (2u << 4);
 
       // Set limits
       c.linearLimitLower = PxVec3(0.0f);
@@ -1038,15 +1088,24 @@ static void prepareArticulationInternalJoints(
       }
 
       c.angularMotion = 0;
-      if (jointCore->motion[PxArticulationAxis::eTWIST] !=
-          PxArticulationMotion::eLOCKED)
-        c.angularMotion |= 1;
-      if (jointCore->motion[PxArticulationAxis::eSWING1] !=
-          PxArticulationMotion::eLOCKED)
-        c.angularMotion |= 2;
-      if (jointCore->motion[PxArticulationAxis::eSWING2] !=
-          PxArticulationMotion::eLOCKED)
-        c.angularMotion |= 4;
+      if (jointCore->motion[PxArticulationAxis::eTWIST] ==
+          PxArticulationMotion::eLIMITED)
+        c.angularMotion |= (1u << 0);
+      else if (jointCore->motion[PxArticulationAxis::eTWIST] ==
+               PxArticulationMotion::eFREE)
+        c.angularMotion |= (2u << 0);
+      if (jointCore->motion[PxArticulationAxis::eSWING1] ==
+          PxArticulationMotion::eLIMITED)
+        c.angularMotion |= (1u << 2);
+      else if (jointCore->motion[PxArticulationAxis::eSWING1] ==
+               PxArticulationMotion::eFREE)
+        c.angularMotion |= (2u << 2);
+      if (jointCore->motion[PxArticulationAxis::eSWING2] ==
+          PxArticulationMotion::eLIMITED)
+        c.angularMotion |= (1u << 4);
+      else if (jointCore->motion[PxArticulationAxis::eSWING2] ==
+               PxArticulationMotion::eFREE)
+        c.angularMotion |= (2u << 4);
 
       if (jointCore->motion[PxArticulationAxis::eTWIST] ==
           PxArticulationMotion::eLIMITED) {
@@ -1068,6 +1127,121 @@ static void prepareArticulationInternalJoints(
             jointCore->limits[PxArticulationAxis::eSWING2].low;
         c.angularLimitUpper.z =
             jointCore->limits[PxArticulationAxis::eSWING2].high;
+      }
+
+      // ---------------------------------------------------------------
+      // Boost penalty for fully-locked joints (eFIX equivalent) so they
+      // can resist drive forces transmitted through cross-links.
+      // ---------------------------------------------------------------
+      if (c.linearMotion == 0 && c.angularMotion == 0) {
+        c.header.rho = PxMax(c.header.rho,
+                             AvbdConstants::AVBD_DEFAULT_PENALTY_RHO_HIGH);
+      }
+
+      // ---------------------------------------------------------------
+      // Copy articulation drive parameters to D6 drive fields
+      //
+      // The drive uses position-error (targetP - currentQ) rather than
+      // the raw target, matching the standalone articulation solver.
+      // This prevents the drive from applying full-position displacement
+      // each step which would overpower fixed joints.
+      //   v_target = stiffness/(S+D) * (targetP - currentQ)/dt
+      //            + damping/(S+D)  * targetV
+      //   rho_drive = (S+D) / dt^2   (capped)
+      // ---------------------------------------------------------------
+      const PxReal maxDriveStiffness = 100.0f;
+      const PxReal invDt = (dt > 0.0f) ? (1.0f / dt) : 60.0f;
+
+      // Precompute world-space anchor separation and joint frame for
+      // position-error drives.
+      const PxVec3 worldAnchorA =
+          parentBodyCore->body2World.transform(anchorInParent);
+      const PxVec3 worldAnchorB =
+          childBodyCore->body2World.transform(anchorInChild);
+      const PxVec3 anchorSep = worldAnchorB - worldAnchorA;
+      const PxQuat worldFrameA_drive =
+          parentBodyCore->body2World.q * jointCore->parentPose.q;
+
+      // Angular position error: relative rotation in joint frame.
+      const PxQuat worldFrameB_drive =
+          childBodyCore->body2World.q * jointCore->childPose.q;
+      PxQuat relRotDrive =
+          worldFrameA_drive.getConjugate() * worldFrameB_drive;
+      if (relRotDrive.w < 0.0f)
+        relRotDrive = -relRotDrive;
+
+      // Linear drives (eX, eY, eZ)
+      {
+        const PxArticulationAxis::Enum linAxes[3] = {
+            PxArticulationAxis::eX, PxArticulationAxis::eY,
+            PxArticulationAxis::eZ};
+        for (int a = 0; a < 3; ++a) {
+          const PxArticulationDrive &drive = jointCore->drives[linAxes[a]];
+          if (drive.driveType == PxArticulationDriveType::eNONE)
+            continue;
+          PxReal totalSD =
+              PxMin(drive.stiffness + drive.damping, maxDriveStiffness);
+          if (totalSD <= 0.0f)
+            continue;
+          c.driveFlags |= (1u << a); // bit 0=X, 1=Y, 2=Z
+          (&c.linearDamping.x)[a] = totalSD;
+
+          // Compute current joint displacement along the driven axis
+          PxVec3 localAxis(0.0f);
+          (&localAxis.x)[a] = 1.0f;
+          PxVec3 worldAxis = worldFrameA_drive.rotate(localAxis);
+          PxReal currentQ = anchorSep.dot(worldAxis);
+
+          // Position-error spring: drive toward (targetP - currentQ)
+          PxReal targetP = jointCore->targetP[linAxes[a]];
+          PxReal posVel = (targetP - currentQ) * invDt;
+          PxReal velVel = jointCore->targetV[linAxes[a]];
+          PxReal invSD = 1.0f / totalSD;
+          PxReal sClamped = PxMin(drive.stiffness, maxDriveStiffness);
+          PxReal dClamped = totalSD - sClamped;
+          (&c.driveLinearVelocity.x)[a] =
+              sClamped * invSD * posVel + dClamped * invSD * velVel;
+        }
+      }
+
+      // Angular drives (eTWIST, eSWING1, eSWING2)
+      {
+        const PxArticulationAxis::Enum angAxes[3] = {
+            PxArticulationAxis::eTWIST, PxArticulationAxis::eSWING1,
+            PxArticulationAxis::eSWING2};
+        // Drive flags: bit3=twist, bit4=swing1, bit5=swing2
+        const PxU32 angBits[3] = {(1u << 3), (1u << 4), (1u << 5)};
+        for (int a = 0; a < 3; ++a) {
+          const PxArticulationDrive &drive = jointCore->drives[angAxes[a]];
+          if (drive.driveType == PxArticulationDriveType::eNONE)
+            continue;
+          PxReal totalSD =
+              PxMin(drive.stiffness + drive.damping, maxDriveStiffness);
+          if (totalSD <= 0.0f)
+            continue;
+          c.driveFlags |= angBits[a];
+          (&c.angularDamping.x)[a] = totalSD;
+
+          // Compute current joint angle for the driven axis.
+          // For twist (a=0) use atan2(x,w); for swings approximate
+          // with atan2(y,w) / atan2(z,w).
+          PxReal currentAngle;
+          if (a == 0)
+            currentAngle = 2.0f * PxAtan2(relRotDrive.x, relRotDrive.w);
+          else if (a == 1)
+            currentAngle = 2.0f * PxAtan2(relRotDrive.y, relRotDrive.w);
+          else
+            currentAngle = 2.0f * PxAtan2(relRotDrive.z, relRotDrive.w);
+
+          PxReal targetAng = jointCore->targetP[angAxes[a]];
+          PxReal posVel = (targetAng - currentAngle) * invDt;
+          PxReal velVel = jointCore->targetV[angAxes[a]];
+          PxReal invSD = 1.0f / totalSD;
+          PxReal sClamped = PxMin(drive.stiffness, maxDriveStiffness);
+          PxReal dClamped = totalSD - sClamped;
+          (&c.driveAngularVelocity.x)[a] =
+              sClamped * invSD * posVel + dClamped * invSD * velVel;
+        }
       }
 
       numD6++;

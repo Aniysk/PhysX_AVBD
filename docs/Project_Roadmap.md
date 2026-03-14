@@ -2,12 +2,12 @@
 
 - **Repository**: `VigorFox/PhysX_AVBD`
 - **Author**: Vulpes (@VigorFox)
-- **Version**: 0.4 (D6 Unified Joint System)
-- **Last Updated**: March 7, 2026
+- **Version**: 0.5 (Articulation Solver)
+- **Last Updated**: March 15, 2026
 
 **Overview**: This roadmap serves as a formal guide for AI Agents (e.g., Claude, Gemini, ChatGPT) to assist in the iterative development of PhysX_AVBD. The project forks NVIDIA's PhysX SDK and integrates an experimental position-level Augmented Vertex Block Descent (AVBD) solver, with 99.9% AI-generated code. 
 **Status Legend**: `Integrated` = merged into main code path; `Accepted` = integrated and validated by acceptance checks; `Pending` = not complete or acceptance gate not closed.
-**Current status**: All joint types (Spherical, Fixed, Revolute, Prismatic) have been unified into a single D6 constraint path ("万物皆D6"). Gear joint is `Accepted` with post-solve motor. PhysX and avbd_standalone share identical algorithm. Standalone regression baseline is `Accepted` at 53 aligned cases. All joint types, limits, and drives are `Accepted`.
+**Current status**: **Articulation solver is `Accepted`** — pure AVBD penalty-based articulation (no Featherstone) passes 29/29 PhysX tests including scissor lift with closed kinematic loops and loaded stability. Per-island adaptive iteration override implemented. All joint types unified into D6 path ("万物皆D6"). Standalone regression: 99/99 tests. PhysX and avbd_standalone share identical algorithm.
 
 The roadmap is phased, with checklists for each stage. Prioritize CPU paths, unified rigid/soft-body solving, and alignment with PhysX architecture. Use AI prompts for code generation, testing, and optimization. Track progress via GitHub issues/PRs and update X thread (ID: `2021997979444687179`) after each milestone for visibility.
 
@@ -43,19 +43,21 @@ The roadmap is phased, with checklists for each stage. Prioritize CPU paths, uni
 
 ---
 
-## Phase 2: Advanced Multibody Systems (2-3 Weeks)
-**Goal**: Support complex articulated bodies, aligning with PhysX's reduced-coordinate features.
+## Phase 2: Advanced Multibody Systems (✅ Articulation Solver Complete)
+**Goal**: Support complex articulated bodies.
 
-- [ ] Featherstone Articulation Compatibility:
-  - Implement reduced-coordinate multibody dynamics.
-  - Support joint limits, drives, and contacts.
-  - Test scenarios: Ragdoll, vehicle suspension, robotic arm.
+- [x] **Pure AVBD Articulation** (no Featherstone dependency):
+  - Articulation internal joints (eFIX, eREVOLUTE, eSPHERICAL, ePRISMATIC) as penalty constraints in unified ADMM loop.
+  - Joint limits, position/velocity drives, friction — all as AL constraint rows.
+  - Closed kinematic loops (D6 cross-links) handled natively without special treatment.
+  - Per-island adaptive iteration override via `setSolverIterationCounts()`.
+  - 12 bugs fixed during integration (motion encoding, drive errors, penalty balance, byte order, etc.).
+  - **Result**: 29/29 PhysX tests pass (15 consecutive deterministic runs). Exceeds Featherstone hybrid ceiling (28/1).
+- [x] Scissor lift with loaded boxes stable through full 10s simulation.
+- [x] Standalone: 99/99 tests including convergence acceleration (AA 47%, Chebyshev 29%).
 - [ ] Coexistence with Native GPU FEM Soft-Bodies (Flag-based switching).
- - [ ] PhysX↔Standalone behavior parity harness:
-  - Build scene-level parity checks (residual trends, convergence iterations, drift envelopes).
-  - Include Prismatic limit crossing and mixed-joint chains as mandatory parity scenes.
-  - **AI Prompt Example**: `"Extend AVBD to Featherstone Articulations in PhysX, ensuring Hessian consistency and island threading."`
-  - **Milestone**: Mixed articulated rigid/soft scenes stable. New demo: Articulated chainmail with soft attachments.
+- [ ] PhysX↔Standalone behavior parity harness.
+  - **Milestone**: ✅ Articulation solver accepted. Scissor lift exceeds TGS+Featherstone stability.
 
 ---
 

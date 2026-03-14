@@ -60,6 +60,12 @@ PX_FORCE_INLINE void copyToAvbdSolverBody(const PxsBodyCore &core,
 
   // Initialize AVBD solver body
   body.initialize(pose, linVel, angVel, invMass, invInertiaTensor, bodyIndex);
+
+  // Copy per-body damping and velocity caps
+  body.linearDamping = core.linearDamping;
+  body.angularDampingBody = core.angularDamping;
+  body.maxLinearVelocitySq = core.maxLinearVelocitySq;
+  body.maxAngularVelocitySq = core.maxAngularVelocitySq;
 }
 
 /**

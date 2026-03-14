@@ -118,6 +118,15 @@ struct PX_ALIGN_PREFIX(16) AvbdSolverBody {
       numConstraints; //!< Number of constraints connected to this body
 
   //-------------------------------------------------------------------------
+  // Per-body damping and velocity caps (from PxsBodyCore)
+  //-------------------------------------------------------------------------
+
+  physx::PxReal linearDamping;       //!< Per-body linear damping (0 = none)
+  physx::PxReal angularDampingBody;  //!< Per-body angular damping (0 = none)
+  physx::PxReal maxLinearVelocitySq; //!< Max linear velocity squared
+  physx::PxReal maxAngularVelocitySq;//!< Max angular velocity squared
+
+  //-------------------------------------------------------------------------
   // Methods
   //-------------------------------------------------------------------------
 
@@ -147,6 +156,10 @@ struct PX_ALIGN_PREFIX(16) AvbdSolverBody {
     lockFlags = 0;
     colorGroup = 0;
     numConstraints = 0;
+    linearDamping = 0.0f;
+    angularDampingBody = 0.0f;
+    maxLinearVelocitySq = PX_MAX_F32;
+    maxAngularVelocitySq = PX_MAX_F32;
   }
 
   /**

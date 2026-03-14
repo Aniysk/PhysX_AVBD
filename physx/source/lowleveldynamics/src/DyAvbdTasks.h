@@ -67,6 +67,12 @@ struct AvbdIslandBatch {
   PxU32 islandStart;
   PxU32 islandEnd;
 
+  // Per-island iteration budget (0 = use solver config default).
+  // Set from the articulation's setSolverIterationCounts() when present,
+  // so articulations can request more iterations without penalising
+  // contact-only islands that converge quickly.
+  PxU32 iterationOverride;
+
   // Pre-computed constraint coloring (for large islands)
   // These are computed in the single-threaded update() phase to avoid
   // race conditions when multiple island tasks run concurrently.
@@ -119,12 +125,14 @@ public:
                               mBatch.d6Joints, mBatch.numD6, mBatch.gearJoints,
                               mBatch.numGear, mGravity, &mBatch.contactMap,
                               &mBatch.d6Map, &mBatch.gearMap,
-                              mBatch.colorBatches, mBatch.numColors);
+                              mBatch.colorBatches, mBatch.numColors,
+                              mBatch.iterationOverride);
     } else {
       // Optimized contact-only path using external contactMap for thread safety
       mSolver.solve(mDt, mBatch.bodies, mBatch.numBodies, mBatch.constraints,
                     mBatch.numConstraints, mGravity, &mBatch.contactMap,
-                    mBatch.colorBatches, mBatch.numColors);
+                    mBatch.colorBatches, mBatch.numColors,
+                    mBatch.iterationOverride);
     }
   }
 

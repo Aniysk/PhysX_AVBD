@@ -88,6 +88,38 @@ bool test71_coulombCone_noExplosion();
 bool test72_geometricMeanFriction();
 bool test73_longTermFrictionStability();
 
+// Articulation (pure AVBD AL constraints)
+bool test74_articulationPendulum();
+bool test75_articulationChain5();
+bool test76_articulationOnGround();
+bool test77_articulationWithLimits();
+bool test78_articulationSpherical();
+bool test79_articulationFixed();
+bool test80_articulationPrismatic();
+bool test81_articulationPrismaticLimits();
+bool test82_articulationPDDrive();
+bool test83_articulationJointFriction();
+bool test84_articulationConstraintAccuracy();
+bool test85_articulationMixedJoints();
+bool test86_articulationFloatingBase();
+bool test87_articulationBranching();
+bool test88_articulationVelocityDrive();
+bool test89_articulationMassRatio();
+bool test90_articulationDriveGravComp();
+bool test91_articulationIDExtraction();
+bool test92_articulationEndEffectorIK();
+bool test93_articulationLongChain();
+bool test94_articulationPrismaticDriveTracking();
+bool test95_articulationMultiArticulation();
+bool test96_articulationFloatingBaseMomentum();
+bool test97_articulationMimicJoint();
+bool test98_convergenceBenchmark();
+bool test99_treeSweepConvergence();
+bool test100_andersonAcceleration();
+bool test101_chebyshevSemiIterative();
+bool test102_articulationD6LoopClosure();
+bool test103_scissorLiftValidation();
+
 int gTestsPassed = 0;
 int gTestsFailed = 0;
 
@@ -178,6 +210,41 @@ int main() {
   test71_coulombCone_noExplosion();
   test72_geometricMeanFriction();
   test73_longTermFrictionStability();
+
+  // Articulation tests (pure AVBD AL constraints)
+  test74_articulationPendulum();
+  test75_articulationChain5();
+  test76_articulationOnGround();
+  test77_articulationWithLimits();
+  test78_articulationSpherical();
+  test79_articulationFixed();
+  test80_articulationPrismatic();
+  test81_articulationPrismaticLimits();
+  test82_articulationPDDrive();
+  test83_articulationJointFriction();
+  test84_articulationConstraintAccuracy();
+  test85_articulationMixedJoints();
+  test86_articulationFloatingBase();
+  test87_articulationBranching();
+  test88_articulationVelocityDrive();
+  test89_articulationMassRatio();
+  test90_articulationDriveGravComp();
+  test91_articulationIDExtraction();
+  test92_articulationEndEffectorIK();
+  test93_articulationLongChain();
+  test94_articulationPrismaticDriveTracking();
+  test95_articulationMultiArticulation();
+  test96_articulationFloatingBaseMomentum();
+  test97_articulationMimicJoint();
+
+  // Phase 3: Convergence & Performance
+  test98_convergenceBenchmark();
+  test99_treeSweepConvergence();
+  test100_andersonAcceleration();
+  test101_chebyshevSemiIterative();
+  // Phase 4: Scissor Lift Validation
+  test102_articulationD6LoopClosure();
+  test103_scissorLiftValidation();
   printf("\n=========================================\n");
   printf("Tests Passed: %d\n", gTestsPassed);
   printf("Tests Failed: %d\n", gTestsFailed);

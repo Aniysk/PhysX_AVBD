@@ -1,4 +1,5 @@
 #pragma once
+#include "avbd_articulation.h"
 #include "avbd_types.h"
 #include <vector>
 
@@ -21,10 +22,21 @@ struct Solver {
   bool use3x3Solve = false; // false=6x6 LDLT (default), true=block-elim 3x3
   bool verbose = false;     // per-iteration logging
 
+  // Phase 3: Convergence acceleration
+  bool useTreeSweep = false;           // tree-structured sweep ordering for artic chains
+  bool useAndersonAccel = false;       // Anderson Acceleration on body positions
+  int aaWindowSize = 3;                // AA window size (m)
+  bool useChebyshev = false;           // Chebyshev semi-iterative position relaxation
+  float chebyshevSpectralRadius = 0.92f; // estimated spectral radius
+
+  // Per-step convergence history (populated if articulations present)
+  std::vector<float> convergenceHistory;
+
   std::vector<Body> bodies;
   std::vector<Contact> contacts;
   std::vector<D6Joint> d6Joints;     // unified: all joint types
   std::vector<GearJoint> gearJoints; // kept separate (velocity constraint)
+  std::vector<Articulation> articulations; // pure AVBD articulations (AL constraints)
 
   // Joint creation (all return index into d6Joints)
   uint32_t addSphericalJoint(uint32_t bodyA, uint32_t bodyB,

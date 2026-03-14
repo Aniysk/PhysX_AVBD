@@ -89,7 +89,8 @@ public:
              const physx::PxVec3 &gravity,
              const AvbdBodyConstraintMap *contactMap = nullptr,
              AvbdColorBatch *colorBatches = nullptr,
-             physx::PxU32 numColors = 0);
+             physx::PxU32 numColors = 0,
+             physx::PxU32 iterationOverride = 0);
 
   /**
    * @brief Execute one simulation step with joint constraints (unified D6 + gear)
@@ -119,7 +120,8 @@ public:
                        const AvbdBodyConstraintMap *d6Map = nullptr,
                        const AvbdBodyConstraintMap *gearMap = nullptr,
                        AvbdColorBatch *colorBatches = nullptr,
-                       physx::PxU32 numColors = 0);
+                       physx::PxU32 numColors = 0,
+                       physx::PxU32 iterationOverride = 0);
 
   /**
    * @brief Get solver statistics from last solve

@@ -188,7 +188,10 @@ private:
                               PxU32 &numD6, PxU32 maxD6,
                               AvbdGearJointConstraint *gearConstraints,
                               PxU32 &numGear, PxU32 maxGear, PxU32 islandIndex,
-                              PxU32 *bodyRemapTable);
+                              PxU32 *bodyRemapTable,
+                              PxU32 *articulationFirstLinkIndex,
+                              FeatherstoneArticulation **articulationByActiveIdx,
+                              PxU32 numArticulations);
 
   //-------------------------------------------------------------------------
   // Member Variables

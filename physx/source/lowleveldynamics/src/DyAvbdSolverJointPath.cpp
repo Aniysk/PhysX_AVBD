@@ -295,6 +295,10 @@ void AvbdSolver::solveLocalSystemWithJoints(
       physx::PxReal pen = physx::PxMax(jnt.header.rho, mEff * invDt2);
       physx::PxReal signJ = isBodyA ? 1.0f : -1.0f;
 
+      // Lever arm from body COM to constraint anchor (used by linear DOFs
+      // AND linear drive).  Computed once and reused.
+      physx::PxVec3 rArm(0.0f);
+
       // --- Linear DOFs (LOCKED / LIMITED / FREE) ---
       // Axis selection matches avbd_standalone:
       //   All-LOCKED => world axes (well-conditioned Hessian)
@@ -318,6 +322,7 @@ void AvbdSolver::solveLocalSystemWithJoints(
                                   bodies[bodyAIdx].rotation.rotate(jnt.anchorA);
         }
 
+        rArm = r;  // export to outer scope for drive
         physx::PxVec3 posError = worldAnchorA - worldAnchorB;
 
         // Compute joint-frame axes in world space
@@ -660,14 +665,27 @@ void AvbdSolver::solveLocalSystemWithJoints(
             physx::PxReal signAL = isBodyA ? -1.0f : 1.0f;
             physx::PxReal f = signAL * (rho_drive * C + lam);
 
-            // Hessian: -_drive - (wAxis - wAxis) on linear block
+            // Full 6D Jacobian Jd = (wAxis, rArm x wAxis), matching
+            // standalone.  The drive force acts at the anchor point, so
+            // the lever arm produces torque.
+            physx::PxVec3 rCrossW = rArm.cross(wAxis);
+
+            // Hessian: outer(Jd, Jd * rho_drive) -> all 4 blocks
             for (int k = 0; k < 3; ++k)
-              for (int l = 0; l < 3; ++l)
+              for (int l = 0; l < 3; ++l) {
                 A.linearLinear(k, l) +=
                     rho_drive * (&wAxis.x)[k] * (&wAxis.x)[l];
+                A.linearAngular(k, l) +=
+                    rho_drive * (&wAxis.x)[k] * (&rCrossW.x)[l];
+                A.angularLinear(k, l) +=
+                    rho_drive * (&rCrossW.x)[k] * (&wAxis.x)[l];
+                A.angularAngular(k, l) +=
+                    rho_drive * (&rCrossW.x)[k] * (&rCrossW.x)[l];
+              }
 
-            // RHS
+            // RHS: gradient on both linear and angular
             gLinear += physx::PxVec3(f * wAxis.x, f * wAxis.y, f * wAxis.z);
+            gAngular += physx::PxVec3(f * rCrossW.x, f * rCrossW.y, f * rCrossW.z);
           }
         }
 
@@ -1150,7 +1168,8 @@ void AvbdSolver::solveWithJoints(
     AvbdGearJointConstraint *gearJoints, physx::PxU32 numGear,
     const physx::PxVec3 &gravity, const AvbdBodyConstraintMap *contactMap,
     const AvbdBodyConstraintMap *d6Map, const AvbdBodyConstraintMap *gearMap,
-    AvbdColorBatch *colorBatches, physx::PxU32 numColors) {
+    AvbdColorBatch *colorBatches, physx::PxU32 numColors,
+    physx::PxU32 iterationOverride) {
 
   PX_PROFILE_ZONE("AVBD.solveWithJoints", 0);
 
@@ -1440,10 +1459,12 @@ void AvbdSolver::solveWithJoints(
   {
     PX_PROFILE_ZONE("AVBD.solveIterations", 0);
 
+    const physx::PxU32 baseIters = (iterationOverride > 0)
+        ? iterationOverride : mConfig.innerIterations;
     const physx::PxU32 jointIterations =
         (mStats.numJoints > 0)
-            ? physx::PxMax(mConfig.innerIterations, physx::PxU32(8))
-            : mConfig.innerIterations;
+            ? physx::PxMax(baseIters, physx::PxU32(8))
+            : baseIters;
 
     for (physx::PxU32 iter = 0; iter < jointIterations; ++iter) {
       // --- Primal step: block descent over bodies ---
@@ -2010,6 +2031,34 @@ void AvbdSolver::solveWithJoints(
         bodies[i].angularVelocity =
             physx::PxVec3(deltaQ.x, deltaQ.y, deltaQ.z) * (2.0f * invDt);
         bodies[i].angularVelocity *= mConfig.angularDamping;
+
+        // Per-body damping (exponential decay per timestep)
+        if (bodies[i].linearDamping > 0.0f) {
+          physx::PxReal linDecay =
+              1.0f / (1.0f + bodies[i].linearDamping * dt);
+          bodies[i].linearVelocity *= linDecay;
+        }
+        if (bodies[i].angularDampingBody > 0.0f) {
+          physx::PxReal angDecay =
+              1.0f / (1.0f + bodies[i].angularDampingBody * dt);
+          bodies[i].angularVelocity *= angDecay;
+        }
+
+        // Per-body velocity capping
+        physx::PxReal linVelSq =
+            bodies[i].linearVelocity.magnitudeSquared();
+        if (linVelSq > bodies[i].maxLinearVelocitySq &&
+            bodies[i].maxLinearVelocitySq > 0.0f) {
+          bodies[i].linearVelocity *=
+              physx::PxSqrt(bodies[i].maxLinearVelocitySq / linVelSq);
+        }
+        physx::PxReal angVelSq =
+            bodies[i].angularVelocity.magnitudeSquared();
+        if (angVelSq > bodies[i].maxAngularVelocitySq &&
+            bodies[i].maxAngularVelocitySq > 0.0f) {
+          bodies[i].angularVelocity *=
+              physx::PxSqrt(bodies[i].maxAngularVelocitySq / angVelSq);
+        }
       }
     }
 

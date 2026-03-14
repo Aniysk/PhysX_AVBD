@@ -54,13 +54,12 @@ struct KahanSum {
 // Main Solver Entry Point
 //=============================================================================
 
-physx::PxU32 g_diagFrameCur = 0;
-
 void AvbdSolver::solve(physx::PxReal dt, AvbdSolverBody *bodies,
                        physx::PxU32 numBodies, AvbdContactConstraint *contacts,
                        physx::PxU32 numContacts, const physx::PxVec3 &gravity,
                        const AvbdBodyConstraintMap *contactMap,
-                       AvbdColorBatch *colorBatches, physx::PxU32 numColors) {
+                       AvbdColorBatch *colorBatches, physx::PxU32 numColors,
+                       physx::PxU32 iterationOverride) {
   PX_PROFILE_ZONE("AVBD.solve", 0);
 
   if (!mInitialized || numBodies == 0) {
@@ -176,9 +175,10 @@ void AvbdSolver::solve(physx::PxReal dt, AvbdSolverBody *bodies,
         effectiveMass = physx::PxMax(massA, massB);
         penScale = 0.05f;
       } else {
-        // Body-vs-static: full stiffness (0.25) for stable stacking.
+        // Body-vs-static: high stiffness to compete with joint penalties
+        // in articulation scenarios (joint rho ~1e6).
         effectiveMass = physx::PxMax(massA, massB);
-        penScale = 0.25f;
+        penScale = 2.0f;
       }
 
       const physx::PxReal effectiveMassH2 = effectiveMass * invDt2;
@@ -274,7 +274,9 @@ void AvbdSolver::solve(physx::PxReal dt, AvbdSolverBody *bodies,
     PX_PROFILE_ZONE("AVBD.solveIterations", 0);
 
     // Both 6x6 and 3x3 paths use AL dual update => primal+dual each iteration
-    for (physx::PxU32 iter = 0; iter < mConfig.innerIterations; ++iter) {
+    const physx::PxU32 iters = (iterationOverride > 0)
+        ? iterationOverride : mConfig.innerIterations;
+    for (physx::PxU32 iter = 0; iter < iters; ++iter) {
       {
         PX_PROFILE_ZONE("AVBD.blockDescent", 0);
         blockDescentIteration(bodies, numBodies, contacts, numContacts, dt,
@@ -311,14 +313,38 @@ void AvbdSolver::solve(physx::PxReal dt, AvbdSolverBody *bodies,
 
         // Apply angular damping
         bodies[i].angularVelocity *= mConfig.angularDamping;
+
+        // Per-body damping (exponential decay per timestep)
+        if (bodies[i].linearDamping > 0.0f) {
+          physx::PxReal linDecay =
+              1.0f / (1.0f + bodies[i].linearDamping * dt);
+          bodies[i].linearVelocity *= linDecay;
+        }
+        if (bodies[i].angularDampingBody > 0.0f) {
+          physx::PxReal angDecay =
+              1.0f / (1.0f + bodies[i].angularDampingBody * dt);
+          bodies[i].angularVelocity *= angDecay;
+        }
+
+        // Per-body velocity capping
+        physx::PxReal linVelSq =
+            bodies[i].linearVelocity.magnitudeSquared();
+        if (linVelSq > bodies[i].maxLinearVelocitySq &&
+            bodies[i].maxLinearVelocitySq > 0.0f) {
+          bodies[i].linearVelocity *=
+              physx::PxSqrt(bodies[i].maxLinearVelocitySq / linVelSq);
+        }
+        physx::PxReal angVelSq =
+            bodies[i].angularVelocity.magnitudeSquared();
+        if (angVelSq > bodies[i].maxAngularVelocitySq &&
+            bodies[i].maxAngularVelocitySq > 0.0f) {
+          bodies[i].angularVelocity *=
+              physx::PxSqrt(bodies[i].maxAngularVelocitySq / angVelSq);
+        }
       }
     }
   }
 
-  // === DIAGNOSTIC: dump solve() output for regression comparison ===
-  if (g_diagFrameCur < 6) {
-    g_diagFrameCur++;
-  }
 }
 
 //=============================================================================
@@ -841,18 +867,6 @@ void AvbdSolver::solveLocalSystem(AvbdSolverBody &body, AvbdSolverBody *bodies,
   physx::PxVec3 deltaPos;
   physx::PxVec3 deltaTheta;
 
-  if (bodyIndex == 0 && g_diagFrameCur == 5) {
-    printf("[DIAG-CUR-DET-6X6] fr=5 solver=6x6 body 0 "
-           "g=(%.6f,%.6f,%.6f | %.6f,%.6f,%.6f)\n",
-           rhs.linear.x, rhs.linear.y, rhs.linear.z, rhs.angular.x,
-           rhs.angular.y, rhs.angular.z);
-    printf("[DIAG-CUR-DET-6X6] fr=5 solver=6x6 body 0 "
-           "H_diag=(%.1f,%.1f,%.1f | %.1f,%.1f,%.1f)\n",
-           A.linearLinear.column0.x, A.linearLinear.column1.y,
-           A.linearLinear.column2.z, A.angularAngular.column0.x,
-           A.angularAngular.column1.y, A.angularAngular.column2.z);
-  }
-
   if (ldlt.decomposeWithRegularization(A)) {
     AvbdVec6 delta = ldlt.solve(rhs);
     deltaPos = delta.linear;
@@ -866,20 +880,6 @@ void AvbdSolver::solveLocalSystem(AvbdSolverBody &body, AvbdSolverBody *bodies,
   // Step 5: Apply update  x -= delta
   //   (ref: solver.cpp L137-138)
   // =========================================================================
-
-  if (bodyIndex == 0 && g_diagFrameCur == 5) {
-    printf("[DIAG-CUR-DET-6X6] fr=5 solver=6x6 body 0 "
-           "deltaPos=(%.6f,%.6f,%.6f) deltaTheta=(%.6f,%.6f,%.6f)\n",
-           deltaPos.x, deltaPos.y, deltaPos.z, deltaTheta.x, deltaTheta.y,
-           deltaTheta.z);
-  }
-
-  if (bodyIndex == 0 && g_diagFrameCur == 5) {
-    printf("[DIAG-CUR-DET-6X6] fr=5 solver=6x6 body 0 "
-           "deltaPos=(%.6f,%.6f,%.6f) deltaTheta=(%.6f,%.6f,%.6f)\n",
-           deltaPos.x, deltaPos.y, deltaPos.z, deltaTheta.x, deltaTheta.y,
-           deltaTheta.z);
-  }
 
   body.position -= deltaPos;
 
