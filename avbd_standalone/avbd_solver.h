@@ -2,12 +2,32 @@
 #include "avbd_articulation.h"
 #include "avbd_contact_prep.h"
 #include "avbd_types.h"
+#include <functional>
 #include <vector>
 
 namespace AvbdRef {
 
 static constexpr float PENALTY_MIN = 1000.0f;
 static constexpr float PENALTY_MAX = 1e9f;
+
+struct TaskRange {
+  uint32_t begin = 0;
+  uint32_t end = 0;
+};
+
+struct TaskSystem {
+  virtual ~TaskSystem() = default;
+  virtual void parallelFor(TaskRange range,
+                           const std::function<void(TaskRange)> &fn) = 0;
+  virtual void wait() {}
+};
+
+struct InlineTaskSystem final : TaskSystem {
+  void parallelFor(TaskRange range,
+                   const std::function<void(TaskRange)> &fn) override {
+    fn(range);
+  }
+};
 
 struct Solver {
   Vec3 gravity = {0, -9.8f, 0};
@@ -24,10 +44,10 @@ struct Solver {
   bool verbose = false;     // per-iteration logging
 
   // Phase 3: Convergence acceleration
-  bool useTreeSweep = false;           // tree-structured sweep ordering for artic chains
-  bool useAndersonAccel = false;       // Anderson Acceleration on body positions
-  int aaWindowSize = 3;                // AA window size (m)
-  bool useChebyshev = false;           // Chebyshev semi-iterative position relaxation
+  bool useTreeSweep = false;             // tree-structured sweep ordering for artic chains
+  bool useAndersonAccel = false;         // Anderson Acceleration on body positions
+  int aaWindowSize = 3;                  // AA window size (m)
+  bool useChebyshev = false;             // Chebyshev semi-iterative position relaxation
   float chebyshevSpectralRadius = 0.92f; // estimated spectral radius
 
   // Per-step convergence history (populated if articulations present)
@@ -38,6 +58,41 @@ struct Solver {
   std::vector<D6Joint> d6Joints;     // unified: all joint types
   std::vector<GearJoint> gearJoints; // kept separate (velocity constraint)
   std::vector<Articulation> articulations; // pure AVBD articulations (AL constraints)
+
+  struct IslandData {
+    std::vector<uint32_t> bodies;
+    std::vector<uint32_t> contacts;
+    std::vector<uint32_t> d6Joints;
+    std::vector<uint32_t> gearJoints;
+    std::vector<uint32_t> articulations;
+    std::vector<uint32_t> articulationBodies;
+  };
+
+  struct ConstraintGraph {
+    struct Node {
+      enum Type : uint8_t { ContactNode, D6Node, GearNode, ArticulationJointNode, MimicNode, IKNode };
+      Type type = ContactNode;
+      uint32_t index0 = 0;
+      uint32_t index1 = 0;
+      std::vector<uint32_t> bodies;
+    };
+
+    std::vector<Node> nodes;
+    std::vector<std::vector<uint32_t>> colors;
+  };
+
+  struct PipelineBuffers {
+    std::vector<std::vector<uint32_t>> adjacency;
+    std::vector<float> propagatedMass;
+    std::vector<IslandData> islands;
+    std::vector<std::vector<uint32_t>> contactBatches;
+    std::vector<ConstraintGraph> constraintGraphs;
+    std::vector<std::vector<uint32_t>> sweepOrders;
+  };
+
+  TaskSystem *taskSystem = nullptr;
+  InlineTaskSystem inlineTaskSystem;
+  PipelineBuffers pipeline;
 
   // Joint creation (all return index into d6Joints)
   uint32_t addSphericalJoint(uint32_t bodyA, uint32_t bodyB,
@@ -59,6 +114,9 @@ struct Solver {
   uint32_t addPrismaticJoint(uint32_t bodyA, uint32_t bodyB,
                              Vec3 localAnchorA, Vec3 localAnchorB,
                              Vec3 localAxisA, float rho = 1e6f);
+
+  void setTaskSystem(TaskSystem *tasks) { taskSystem = tasks; }
+  TaskSystem &tasks() { return taskSystem ? *taskSystem : inlineTaskSystem; }
 
   // Cone limit (spherical joints)
   void setSphericalJointConeLimit(uint32_t jointIdx, Vec3 coneAxisA,
@@ -94,6 +152,18 @@ struct Solver {
   void computeConstraint(Contact &c);
   void computeC0(Contact &c);
   void warmstart();
+  void stagePredictionAndInertia(float invDt, float dt2);
+  void stageBuildAdjacency();
+  void stagePropagateMass(float dt2);
+  void stageComputeContactC0();
+  void stageBuildIslands();
+  void stageBuildContactBatches();
+  void stageBuildConstraintGraphs();
+  void stageBuildSweepOrders();
+  void stagePrimalSolve(float invDt, float dt2);
+  void stageDualUpdate(float dt2);
+  void stageVelocityWriteback(float invDt);
+  void applyPostSolveMotors(float invDt, float dt2);
   void step(float dt_);
 };
 
