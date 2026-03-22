@@ -11,6 +11,7 @@
 //   depth > 0 means penetrating
 // =============================================================================
 #pragma once
+#include "avbd_contact_prep.h"
 #include "avbd_solver.h"
 #include <algorithm>
 #include <cmath>
@@ -45,8 +46,11 @@ inline int collideBoxGround(Solver &solver, uint32_t boxIdx,
     if (dist < margin) {
       float depth = -dist; // positive when penetrating
       Vec3 groundPt(wc.x, 0, wc.z);
-      solver.addContact(boxIdx, UINT32_MAX, normal, localCorners[i], groundPt,
-                        depth, box.friction);
+      ContactPrep::ContactMaterial material;
+      material.dynamicFriction = box.friction;
+      solver.addContact(ContactPrep::prepareRow(
+          boxIdx, UINT32_MAX, groundPt, normal, dist, localCorners[i], groundPt,
+          material, nullptr, true));
       count++;
     }
   }
@@ -314,7 +318,9 @@ inline int collideBoxBox(Solver &solver, uint32_t idxA, uint32_t idxB,
   float refPlaneDist = refFaceN.dot(refFaceW[0]);
 
   int contactCount = 0;
-  float fric = sqrtf(bA.friction * bB.friction);
+  ContactPrep::ContactMaterial material;
+  material.dynamicFriction =
+      ContactPrep::ContactMaterial::combineFriction(bA.friction, bB.friction);
 
   // Determine which body is the "incident" body (its face is clipped).
   // In our solver convention, bodyA is the one being pushed along -normal
@@ -357,8 +363,9 @@ inline int collideBoxBox(Solver &solver, uint32_t idxA, uint32_t idxB,
     Vec3 rB_local = solver.bodies[contactBodyB].rotation.conjugate().rotate(
         contactPt - solver.bodies[contactBodyB].position);
 
-    solver.addContact(contactBodyA, contactBodyB, contactNormal, rA_local,
-                      rB_local, depth, fric);
+    solver.addContact(ContactPrep::prepareRow(
+        contactBodyA, contactBodyB, contactPt, contactNormal, -depth, rA_local,
+        rB_local, material));
     contactCount++;
   }
 

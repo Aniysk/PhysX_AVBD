@@ -1,5 +1,6 @@
 #pragma once
 #include "avbd_articulation.h"
+#include "avbd_contact_prep.h"
 #include "avbd_types.h"
 #include <vector>
 
@@ -87,6 +88,7 @@ struct Solver {
   // Contact creation
   void addContact(uint32_t bodyA, uint32_t bodyB, Vec3 normal, Vec3 rA,
                   Vec3 rB, float depth, float fric = 0.5f);
+  void addContact(const ContactPrep::ContactRow &row);
 
   // Solver core
   void computeConstraint(Contact &c);

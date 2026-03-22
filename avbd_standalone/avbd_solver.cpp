@@ -293,23 +293,16 @@ uint32_t Solver::addBody(Vec3 pos, Quat rot, Vec3 halfExtent, float density,
 
 void Solver::addContact(uint32_t bodyA, uint32_t bodyB, Vec3 normal, Vec3 rA,
                         Vec3 rB, float depth, float fric) {
-  Contact c;
-  c.bodyA = bodyA;
-  c.bodyB = bodyB;
-  c.normal = normal;
-  c.rA = rA;
-  c.rB = rB;
-  c.depth = depth;
-  c.friction = fric;
-  for (int i = 0; i < 3; i++) {
-    c.lambda[i] = 0;
-    c.penalty[i] = PENALTY_MIN;
-    c.fmin[i] = 0;
-    c.fmax[i] = 0;
-  }
-  c.fmin[0] = -1e30f;
-  c.fmax[0] = 0.0f;
-  contacts.push_back(c);
+  ContactPrep::ContactMaterial material;
+  material.dynamicFriction = fric;
+  const float separation = -depth;
+  addContact(ContactPrep::prepareRow(bodyA, bodyB, Vec3(), normal, separation,
+                                     rA, rB, material, nullptr,
+                                     bodyB == UINT32_MAX));
+}
+
+void Solver::addContact(const ContactPrep::ContactRow &row) {
+  contacts.push_back(ContactPrep::toSolverContact(row));
 }
 
 // =============================================================================
