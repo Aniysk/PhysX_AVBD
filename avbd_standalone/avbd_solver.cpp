@@ -374,217 +374,361 @@ void Solver::computeC0(Contact &c) {
   c.C0[2] = 0.0f;
 }
 
+
 void Solver::warmstart() {
-  for (auto &c : contacts) {
-    for (int i = 0; i < 3; i++) {
-      c.lambda[i] = c.lambda[i] * alpha * gamma;
-      c.penalty[i] =
-          std::max(PENALTY_MIN, std::min(PENALTY_MAX, c.penalty[i] * gamma));
+  tasks().parallelFor({0u, (uint32_t)contacts.size()}, [&](TaskRange range) {
+    for (uint32_t ci = range.begin; ci < range.end; ++ci) {
+      auto &c = contacts[ci];
+      for (int i = 0; i < 3; i++) {
+        c.lambda[i] = c.lambda[i] * alpha * gamma;
+        c.penalty[i] =
+            std::max(PENALTY_MIN, std::min(PENALTY_MAX, c.penalty[i] * gamma));
+      }
     }
-  }
+  });
 }
 
-// =============================================================================
-// Main solver step
-// =============================================================================
+void Solver::stagePredictionAndInertia(float invDt, float dt2) {
+  tasks().parallelFor({0u, (uint32_t)bodies.size()}, [&](TaskRange range) {
+    for (uint32_t bi = range.begin; bi < range.end; ++bi) {
+      auto &body = bodies[bi];
+      if (body.mass <= 0)
+        continue;
+      body.updateInvInertiaWorld();
+      body.inertialPosition =
+          body.position + body.linearVelocity * dt + gravity * dt2;
+      Quat angVel(0, body.angularVelocity.x, body.angularVelocity.y,
+                  body.angularVelocity.z);
+      body.inertialRotation =
+          (body.rotation + angVel * body.rotation * (0.5f * dt)).normalized();
 
-void Solver::step(float dt_) {
-  dt = dt_;
-  float invDt = 1.0f / dt;
-  float dt2 = dt * dt;
+      Vec3 accel = (body.linearVelocity - body.prevLinearVelocity) * invDt;
+      float gravLen = gravity.length();
+      float accelWeight = 0.0f;
+      if (gravLen > 1e-6f) {
+        Vec3 gravDir = gravity.normalized();
+        accelWeight = std::max(0.0f, std::min(1.0f, accel.dot(gravDir) / gravLen));
+      }
 
-  warmstart();
+      body.initialPosition = body.position;
+      body.initialRotation = body.rotation;
+      body.position = body.position + body.linearVelocity * dt +
+                      gravity * (accelWeight * dt2);
+      body.rotation = body.inertialRotation;
+    }
+  });
+}
 
-  // Step 1: Build adjacency list from joints
-  uint32_t nBodies = (uint32_t)bodies.size();
-  std::vector<std::vector<uint32_t>> adj(nBodies);
+void Solver::stageBuildAdjacency() {
+  const uint32_t nBodies = (uint32_t)bodies.size();
+  pipeline.adjacency.assign(nBodies, {});
   auto addEdge = [&](uint32_t a, uint32_t b) {
     if (a < nBodies && b < nBodies && a != UINT32_MAX && b != UINT32_MAX) {
-      adj[a].push_back(b);
-      adj[b].push_back(a);
+      pipeline.adjacency[a].push_back(b);
+      pipeline.adjacency[b].push_back(a);
     }
   };
   for (const auto &j : d6Joints)
     addEdge(j.bodyA, j.bodyB);
   for (const auto &j : gearJoints)
     addEdge(j.bodyA, j.bodyB);
+  for (const auto &c : contacts)
+    addEdge(c.bodyA, c.bodyB);
   for (const auto &artic : articulations) {
-    for (int ji = 0; ji < (int)artic.joints.size(); ji++) {
+    for (int ji = 0; ji < (int)artic.joints.size(); ++ji) {
       uint32_t child = artic.joints[ji].bodyIndex;
       uint32_t parent = artic.getParentBodyIndex(ji);
       addEdge(parent, child);
     }
   }
+}
 
-  // Step 2: Jacobi propagation of effective mass
-  std::vector<float> mEff(nBodies);
-  for (uint32_t i = 0; i < nBodies; i++)
-    mEff[i] = bodies[i].mass;
+void Solver::stagePropagateMass(float dt2) {
+  const uint32_t nBodies = (uint32_t)bodies.size();
+  pipeline.propagatedMass.resize(nBodies);
+  for (uint32_t i = 0; i < nBodies; ++i)
+    pipeline.propagatedMass[i] = bodies[i].mass;
 
-  for (int d = 0; d < propagationDepth; d++) {
-    std::vector<float> mNext(nBodies);
-    for (uint32_t i = 0; i < nBodies; i++) {
-      float neighborSum = 0.0f;
-      for (uint32_t nb : adj[i])
-        neighborSum += mEff[nb];
-      mNext[i] = bodies[i].mass + propagationDecay * neighborSum;
-    }
-    mEff = mNext;
+  for (int d = 0; d < propagationDepth; ++d) {
+    std::vector<float> next(nBodies, 0.0f);
+    tasks().parallelFor({0u, nBodies}, [&](TaskRange range) {
+      for (uint32_t i = range.begin; i < range.end; ++i) {
+        float neighborSum = 0.0f;
+        for (uint32_t nb : pipeline.adjacency[i])
+          neighborSum += pipeline.propagatedMass[nb];
+        next[i] = bodies[i].mass + propagationDecay * neighborSum;
+      }
+    });
+    pipeline.propagatedMass.swap(next);
   }
 
-  // Step 3: set penalty floor using propagated effective mass
-  for (auto &c : contacts) {
-    float augA = mEff[c.bodyA];
-    float augB = (c.bodyB != UINT32_MAX) ? mEff[c.bodyB] : 0.0f;
-    float massB = (c.bodyB != UINT32_MAX) ? bodies[c.bodyB].mass : 0.0f;
-
-    float effectiveMass, scale;
-    if (c.bodyB != UINT32_MAX && massB > 0.0f) {
-      effectiveMass = std::max(augA, augB);
-      scale = penaltyScaleDynDyn;
-    } else {
-      effectiveMass = augA;
-      scale = penaltyScale;
+  tasks().parallelFor({0u, (uint32_t)contacts.size()}, [&](TaskRange range) {
+    for (uint32_t ci = range.begin; ci < range.end; ++ci) {
+      auto &c = contacts[ci];
+      float augA = pipeline.propagatedMass[c.bodyA];
+      float augB = (c.bodyB != UINT32_MAX) ? pipeline.propagatedMass[c.bodyB] : 0.0f;
+      float massB = (c.bodyB != UINT32_MAX) ? bodies[c.bodyB].mass : 0.0f;
+      float effectiveMass, scale;
+      if (c.bodyB != UINT32_MAX && massB > 0.0f) {
+        effectiveMass = std::max(augA, augB);
+        scale = penaltyScaleDynDyn;
+      } else {
+        effectiveMass = augA;
+        scale = penaltyScale;
+      }
+      float penFloor = std::max(PENALTY_MIN, scale * effectiveMass / dt2);
+      for (int i = 0; i < 3; ++i)
+        c.penalty[i] = std::max(c.penalty[i], penFloor);
     }
-    float penFloor = std::max(PENALTY_MIN, scale * effectiveMass / dt2);
-    for (int i = 0; i < 3; i++)
-      c.penalty[i] = std::max(c.penalty[i], penFloor);
-  }
+  });
+}
 
-  // Compute C0 for alpha blending
-  for (auto &c : contacts)
-    computeC0(c);
+void Solver::stageComputeContactC0() {
+  tasks().parallelFor({0u, (uint32_t)contacts.size()}, [&](TaskRange range) {
+    for (uint32_t ci = range.begin; ci < range.end; ++ci)
+      computeC0(contacts[ci]);
+  });
+}
 
-  // Warmstart bodies
-  for (auto &body : bodies) {
-    if (body.mass <= 0)
+void Solver::stageBuildIslands() {
+  const uint32_t nBodies = (uint32_t)bodies.size();
+  pipeline.islands.clear();
+  std::vector<int> islandOfBody(nBodies, -1);
+
+  for (uint32_t root = 0; root < nBodies; ++root) {
+    if (bodies[root].mass <= 0 || islandOfBody[root] != -1)
       continue;
-    body.updateInvInertiaWorld();
-
-    // Inertial prediction
-    body.inertialPosition =
-        body.position + body.linearVelocity * dt + gravity * dt2;
-    Quat angVel(0, body.angularVelocity.x, body.angularVelocity.y,
-                body.angularVelocity.z);
-    body.inertialRotation =
-        (body.rotation + angVel * body.rotation * (0.5f * dt)).normalized();
-
-    // Adaptive warmstarting
-    Vec3 accel = (body.linearVelocity - body.prevLinearVelocity) * invDt;
-    float gravLen = gravity.length();
-    float accelWeight = 0.0f;
-    if (gravLen > 1e-6f) {
-      Vec3 gravDir = gravity.normalized();
-      accelWeight =
-          std::max(0.0f, std::min(1.0f, accel.dot(gravDir) / gravLen));
-    }
-
-    body.initialPosition = body.position;
-    body.initialRotation = body.rotation;
-
-    body.position = body.position + body.linearVelocity * dt +
-                    gravity * (accelWeight * dt2);
-    body.rotation = body.inertialRotation;
-  }
-
-  // =========================================================================
-  // Compute sweep order (tree-structured for articulation chains)
-  // =========================================================================
-  std::vector<uint32_t> sweepOrder;
-  {
-    std::vector<bool> isArticBody(nBodies, false);
-    std::vector<uint32_t> articOrder;
-    if (useTreeSweep && !articulations.empty()) {
-      for (const auto &artic : articulations) {
-        for (int ji = 0; ji < (int)artic.joints.size(); ji++) {
-          uint32_t bi = artic.joints[ji].bodyIndex;
-          if (bi < nBodies && !isArticBody[bi]) {
-            isArticBody[bi] = true;
-            articOrder.push_back(bi);
-          }
+    IslandData island;
+    std::vector<uint32_t> stack = {root};
+    islandOfBody[root] = (int)pipeline.islands.size();
+    while (!stack.empty()) {
+      uint32_t bi = stack.back();
+      stack.pop_back();
+      island.bodies.push_back(bi);
+      for (uint32_t nb : pipeline.adjacency[bi]) {
+        if (nb < nBodies && bodies[nb].mass > 0 && islandOfBody[nb] == -1) {
+          islandOfBody[nb] = islandOfBody[root];
+          stack.push_back(nb);
         }
       }
     }
-    // Non-articulation bodies first (any order)
-    for (uint32_t i = 0; i < nBodies; i++) {
-      if (!isArticBody[i] && bodies[i].mass > 0)
-        sweepOrder.push_back(i);
-    }
-    // Articulation bodies in tree order (root → leaves)
-    for (uint32_t bi : articOrder)
-      sweepOrder.push_back(bi);
-    // Add remaining dynamic non-artic bodies not yet added
-    // (covers all bodies with mass > 0)
+    pipeline.islands.push_back(std::move(island));
   }
 
-  // =========================================================================
-  // Anderson Acceleration state (positions only — quaternion mixing is
-  // ill-conditioned for AA linear extrapolation)
-  // =========================================================================
-  int aaDim = (int)nBodies * 3; // 3 pos per body
+  for (uint32_t bi = 0; bi < nBodies; ++bi) {
+    if (bodies[bi].mass <= 0)
+      continue;
+    if (islandOfBody[bi] == -1) {
+      IslandData island;
+      island.bodies.push_back(bi);
+      islandOfBody[bi] = (int)pipeline.islands.size();
+      pipeline.islands.push_back(std::move(island));
+    }
+  }
+
+  for (uint32_t ci = 0; ci < contacts.size(); ++ci) {
+    const auto &c = contacts[ci];
+    int island = (c.bodyA < nBodies) ? islandOfBody[c.bodyA] : -1;
+    if (island >= 0)
+      pipeline.islands[island].contacts.push_back(ci);
+  }
+  for (uint32_t ji = 0; ji < d6Joints.size(); ++ji) {
+    const auto &j = d6Joints[ji];
+    int island = (j.bodyA < nBodies && j.bodyA != UINT32_MAX) ? islandOfBody[j.bodyA] :
+                 ((j.bodyB < nBodies) ? islandOfBody[j.bodyB] : -1);
+    if (island >= 0)
+      pipeline.islands[island].d6Joints.push_back(ji);
+  }
+  for (uint32_t gi = 0; gi < gearJoints.size(); ++gi) {
+    const auto &g = gearJoints[gi];
+    int island = (g.bodyA < nBodies) ? islandOfBody[g.bodyA] :
+                 ((g.bodyB < nBodies) ? islandOfBody[g.bodyB] : -1);
+    if (island >= 0)
+      pipeline.islands[island].gearJoints.push_back(gi);
+  }
+  for (uint32_t ai = 0; ai < articulations.size(); ++ai) {
+    const auto &artic = articulations[ai];
+    int island = -1;
+    for (const auto &j : artic.joints) {
+      if (j.bodyIndex < nBodies && islandOfBody[j.bodyIndex] >= 0) {
+        island = islandOfBody[j.bodyIndex];
+        break;
+      }
+    }
+    if (island >= 0) {
+      pipeline.islands[island].articulations.push_back(ai);
+      for (const auto &j : artic.joints)
+        pipeline.islands[island].articulationBodies.push_back(j.bodyIndex);
+    }
+  }
+}
+
+void Solver::stageBuildContactBatches() {
+  pipeline.contactBatches.assign(pipeline.islands.size(), {});
+  for (size_t ii = 0; ii < pipeline.islands.size(); ++ii)
+    pipeline.contactBatches[ii] = pipeline.islands[ii].contacts;
+}
+
+void Solver::stageBuildConstraintGraphs() {
+  pipeline.constraintGraphs.assign(pipeline.islands.size(), {});
+  auto appendBody = [](std::vector<uint32_t> &out, uint32_t body) {
+    if (body != UINT32_MAX)
+      out.push_back(body);
+  };
+
+  for (size_t ii = 0; ii < pipeline.islands.size(); ++ii) {
+    auto &graph = pipeline.constraintGraphs[ii];
+    const auto &island = pipeline.islands[ii];
+
+    for (uint32_t ci : island.contacts) {
+      ConstraintGraph::Node node;
+      node.type = ConstraintGraph::Node::ContactNode;
+      node.index0 = ci;
+      appendBody(node.bodies, contacts[ci].bodyA);
+      appendBody(node.bodies, contacts[ci].bodyB);
+      graph.nodes.push_back(std::move(node));
+    }
+    for (uint32_t ji : island.d6Joints) {
+      ConstraintGraph::Node node;
+      node.type = ConstraintGraph::Node::D6Node;
+      node.index0 = ji;
+      appendBody(node.bodies, d6Joints[ji].bodyA);
+      appendBody(node.bodies, d6Joints[ji].bodyB);
+      graph.nodes.push_back(std::move(node));
+    }
+    for (uint32_t gi : island.gearJoints) {
+      ConstraintGraph::Node node;
+      node.type = ConstraintGraph::Node::GearNode;
+      node.index0 = gi;
+      appendBody(node.bodies, gearJoints[gi].bodyA);
+      appendBody(node.bodies, gearJoints[gi].bodyB);
+      graph.nodes.push_back(std::move(node));
+    }
+    for (uint32_t ai : island.articulations) {
+      const auto &artic = articulations[ai];
+      for (uint32_t ji = 0; ji < artic.joints.size(); ++ji) {
+        ConstraintGraph::Node node;
+        node.type = ConstraintGraph::Node::ArticulationJointNode;
+        node.index0 = ai;
+        node.index1 = ji;
+        appendBody(node.bodies, artic.joints[ji].bodyIndex);
+        appendBody(node.bodies, artic.getParentBodyIndex((int)ji));
+        graph.nodes.push_back(std::move(node));
+      }
+      for (uint32_t mi = 0; mi < artic.mimicJoints.size(); ++mi) {
+        ConstraintGraph::Node node;
+        node.type = ConstraintGraph::Node::MimicNode;
+        node.index0 = ai;
+        node.index1 = mi;
+        appendBody(node.bodies, artic.joints[artic.mimicJoints[mi].jointA].bodyIndex);
+        appendBody(node.bodies, artic.joints[artic.mimicJoints[mi].jointB].bodyIndex);
+        graph.nodes.push_back(std::move(node));
+      }
+      for (uint32_t ti = 0; ti < artic.ikTargets.size(); ++ti) {
+        ConstraintGraph::Node node;
+        node.type = ConstraintGraph::Node::IKNode;
+        node.index0 = ai;
+        node.index1 = ti;
+        if (artic.ikTargets[ti].jointIdx >= 0 &&
+            (uint32_t)artic.ikTargets[ti].jointIdx < artic.joints.size())
+          appendBody(node.bodies, artic.joints[artic.ikTargets[ti].jointIdx].bodyIndex);
+        graph.nodes.push_back(std::move(node));
+      }
+    }
+
+    std::vector<int> nodeColor(graph.nodes.size(), -1);
+    for (size_t ni = 0; ni < graph.nodes.size(); ++ni) {
+      std::vector<bool> used(graph.nodes.size(), false);
+      for (size_t nj = 0; nj < ni; ++nj) {
+        bool shareBody = false;
+        for (uint32_t a : graph.nodes[ni].bodies)
+          for (uint32_t b : graph.nodes[nj].bodies)
+            if (a == b && a != UINT32_MAX)
+              shareBody = true;
+        if (shareBody && nodeColor[nj] >= 0)
+          used[nodeColor[nj]] = true;
+      }
+      int color = 0;
+      while (color < (int)used.size() && used[color])
+        ++color;
+      nodeColor[ni] = color;
+      if ((size_t)color >= graph.colors.size())
+        graph.colors.resize(color + 1);
+      graph.colors[color].push_back((uint32_t)ni);
+    }
+  }
+}
+
+void Solver::stageBuildSweepOrders() {
+  pipeline.sweepOrders.assign(pipeline.islands.size(), {});
+  std::vector<bool> isArticBody(bodies.size(), false);
+  if (useTreeSweep) {
+    for (const auto &artic : articulations)
+      for (const auto &joint : artic.joints)
+        if (joint.bodyIndex < bodies.size())
+          isArticBody[joint.bodyIndex] = true;
+  }
+
+  for (size_t ii = 0; ii < pipeline.islands.size(); ++ii) {
+    auto &order = pipeline.sweepOrders[ii];
+    const auto &island = pipeline.islands[ii];
+    for (uint32_t bi : island.bodies)
+      if (!isArticBody[bi])
+        order.push_back(bi);
+    for (uint32_t bi : island.articulationBodies)
+      if (bi < bodies.size())
+        order.push_back(bi);
+    std::sort(order.begin(), order.end());
+    order.erase(std::unique(order.begin(), order.end()), order.end());
+  }
+}
+
+void Solver::stagePrimalSolve(float invDt, float dt2) {
+  const float contactBoostFraction = 0.005f;
+  int aaDim = (int)bodies.size() * 3;
   int aaCount = 0;
   std::vector<std::vector<float>> aaFHistory, aaXHistory;
   if (useAndersonAccel) {
-    aaFHistory.resize(aaWindowSize);
-    aaXHistory.resize(aaWindowSize);
-    for (int i = 0; i < aaWindowSize; i++) {
-      aaFHistory[i].resize(aaDim, 0.0f);
-      aaXHistory[i].resize(aaDim, 0.0f);
-    }
+    aaFHistory.assign(aaWindowSize, std::vector<float>(aaDim, 0.0f));
+    aaXHistory.assign(aaWindowSize, std::vector<float>(aaDim, 0.0f));
   }
-
-  // Pack body positions into flat vector (for AA)
   auto packState = [&](std::vector<float> &state) {
     state.resize(aaDim);
-    for (uint32_t i = 0; i < nBodies; i++) {
+    for (uint32_t i = 0; i < bodies.size(); i++) {
       state[i * 3 + 0] = bodies[i].position.x;
       state[i * 3 + 1] = bodies[i].position.y;
       state[i * 3 + 2] = bodies[i].position.z;
     }
   };
   auto unpackState = [&](const std::vector<float> &state) {
-    for (uint32_t i = 0; i < nBodies; i++) {
+    for (uint32_t i = 0; i < bodies.size(); i++) {
       if (bodies[i].mass <= 0) continue;
-      bodies[i].position.x = state[i * 3 + 0];
-      bodies[i].position.y = state[i * 3 + 1];
-      bodies[i].position.z = state[i * 3 + 2];
+      bodies[i].position = Vec3(state[i * 3 + 0], state[i * 3 + 1], state[i * 3 + 2]);
     }
   };
 
-  // =========================================================================
-  // Chebyshev state
-  // =========================================================================
   float chebyOmega = 1.0f;
   std::vector<Vec3> chebyPrevPos, chebyPrevPrevPos;
   std::vector<Quat> chebyPrevRot, chebyPrevPrevRot;
   if (useChebyshev) {
-    chebyPrevPos.resize(nBodies);
-    chebyPrevPrevPos.resize(nBodies);
-    chebyPrevRot.resize(nBodies);
-    chebyPrevPrevRot.resize(nBodies);
-    for (uint32_t i = 0; i < nBodies; i++) {
-      chebyPrevPos[i] = bodies[i].position;
-      chebyPrevPrevPos[i] = bodies[i].position;
-      chebyPrevRot[i] = bodies[i].rotation;
-      chebyPrevPrevRot[i] = bodies[i].rotation;
+    chebyPrevPos.resize(bodies.size());
+    chebyPrevPrevPos.resize(bodies.size());
+    chebyPrevRot.resize(bodies.size());
+    chebyPrevPrevRot.resize(bodies.size());
+    for (uint32_t i = 0; i < bodies.size(); ++i) {
+      chebyPrevPos[i] = chebyPrevPrevPos[i] = bodies[i].position;
+      chebyPrevRot[i] = chebyPrevPrevRot[i] = bodies[i].rotation;
     }
   }
 
-  // Convergence history
   convergenceHistory.clear();
 
-  // =========================================================================
-  // Main solver loop
-  // =========================================================================
-  for (int it = 0; it < iterations; it++) {
-    // Save pre-iteration state for AA
+  for (int it = 0; it < iterations; ++it) {
     std::vector<float> preState;
     if (useAndersonAccel)
       packState(preState);
-
-    // Save pre-iteration state for Chebyshev
     if (useChebyshev) {
-      for (uint32_t i = 0; i < nBodies; i++) {
+      for (uint32_t i = 0; i < bodies.size(); ++i) {
         chebyPrevPrevPos[i] = chebyPrevPos[i];
         chebyPrevPrevRot[i] = chebyPrevRot[i];
         chebyPrevPos[i] = bodies[i].position;
@@ -592,469 +736,376 @@ void Solver::step(float dt_) {
       }
     }
 
-    // ---- Primal update (per body in sweep order) ----
-    bool reverseSweep = useTreeSweep && (it % 2 == 1);
-    int nSweep = (int)sweepOrder.size();
-    for (int si = 0; si < nSweep; si++) {
-      int idx = reverseSweep ? (nSweep - 1 - si) : si;
-      uint32_t bi = sweepOrder[idx];
-      Body &body = bodies[bi];
-      if (body.mass <= 0)
-        continue;
+    for (size_t ii = 0; ii < pipeline.islands.size(); ++ii) {
+      const auto &orderBase = pipeline.sweepOrders[ii];
+      std::vector<uint32_t> order = orderBase;
+      if (useTreeSweep && (it % 2 == 1))
+        std::reverse(order.begin(), order.end());
 
-      // Check if this body needs full 6x6 solve
-      bool bodyNeedsFull6x6 = false;
-      if (use3x3Solve) {
-        for (const auto &jnt : d6Joints) {
-          if (jnt.bodyA == bi || jnt.bodyB == bi) {
-            // Any joint with non-trivial coupling needs 6x6
-            if (jnt.linearMotion != 0 || jnt.angularMotion != 0x2A) {
-              // Not purely spherical -> needs 6x6 for coupled solve
-              // Actually, prismatic/revolute have lin-ang coupling
+      for (uint32_t bi : order) {
+        Body &body = bodies[bi];
+        if (body.mass <= 0)
+          continue;
+
+        bool bodyNeedsFull6x6 = false;
+        if (use3x3Solve) {
+          for (uint32_t ji : pipeline.islands[ii].d6Joints) {
+            const auto &jnt = d6Joints[ji];
+            if ((jnt.bodyA == bi || jnt.bodyB == bi) &&
+                (jnt.linearMotion != 0 || jnt.angularMotion != 0x2A)) {
               bodyNeedsFull6x6 = true;
               break;
             }
           }
         }
-      }
 
-      Mat66 lhs = body.getMassMatrix() / dt2;
-      Vec6 disp(body.position - body.inertialPosition, body.deltaWInertial());
-      Vec6 rhs = lhs * disp;
+        Mat66 lhs = body.getMassMatrix() / dt2;
+        Vec6 disp(body.position - body.inertialPosition, body.deltaWInertial());
+        Vec6 rhs = lhs * disp;
+        float boostFloor = contactBoostFraction * body.mass / dt2;
 
-      const float contactBoostFraction = 0.005f;
-      float boostFloor = contactBoostFraction * body.mass / dt2;
-
-      // ---- Contact contributions ----
-      for (auto &c : contacts) {
-        bool isA = (c.bodyA == bi);
-        bool isB = (c.bodyB == bi);
-        if (!isA && !isB)
-          continue;
-
-        computeConstraint(c);
-
-        for (int i = 0; i < 3; i++) {
-          Vec6 J = isA ? (i == 0 ? c.JA : (i == 1 ? c.JAt1 : c.JAt2))
-                       : (i == 0 ? c.JB : (i == 1 ? c.JBt1 : c.JBt2));
-          float pen = std::max(c.penalty[i], boostFloor);
-          float f = std::max(c.fmin[i],
-                             std::min(c.fmax[i], pen * c.C[i] + c.lambda[i]));
-          rhs += J * f;
-          lhs += outer(J, J * pen);
-        }
-      }
-
-      // ---- D6 Joint contributions (unified) ----
-      for (const auto &jnt : d6Joints) {
-        addD6Contribution(jnt, bi, bodies, dt, lhs, rhs);
-      }
-
-      // ---- Articulation contributions (pure AVBD AL constraints) ----
-      for (const auto &artic : articulations) {
-        for (int ji = 0; ji < (int)artic.joints.size(); ji++) {
-          addArticulationContribution(artic, ji, bi, bodies, dt, lhs, rhs);
-        }
-        for (int mi = 0; mi < (int)artic.mimicJoints.size(); mi++) {
-          addMimicJointContribution(artic, mi, bi, bodies, dt, lhs, rhs);
-        }
-        for (int ti = 0; ti < (int)artic.ikTargets.size(); ti++) {
-          addIKTargetContribution(artic, ti, bi, bodies, dt, lhs, rhs);
-        }
-      }
-
-      // ---- Gear Joint contributions ----
-      for (auto &gnt : gearJoints) {
-        bool isA = (gnt.bodyA == bi);
-        bool isB = (gnt.bodyB == bi);
-        if (!isA && !isB)
-          continue;
-        if (gnt.bodyA >= (uint32_t)bodies.size() ||
-            gnt.bodyB >= (uint32_t)bodies.size())
-          continue;
-
-        Body &bA = bodies[gnt.bodyA];
-        Body &bB = bodies[gnt.bodyB];
-        if (bA.mass <= 0.f || bB.mass <= 0.f)
-          continue;
-
-        Vec3 worldAxisA = bA.rotation.rotate(gnt.axisA);
-        Vec3 worldAxisB = bB.rotation.rotate(gnt.axisB);
-        Vec3 dwA = bA.deltaWInitial();
-        Vec3 dwB = bB.deltaWInitial();
-        float C = dwA.dot(worldAxisA) * gnt.gearRatio + dwB.dot(worldAxisB);
-
-        float effectiveRho = std::max(gnt.rho, body.mass / dt2);
-        Vec3 J_ang = isA ? (worldAxisA * gnt.gearRatio) : worldAxisB;
-        float f = effectiveRho * C + gnt.lambdaGear;
-
-        for (int r = 0; r < 3; r++)
-          for (int c2 = 0; c2 < 3; c2++)
-            lhs.m[3 + r][3 + c2] +=
-                effectiveRho * (&J_ang.x)[r] * (&J_ang.x)[c2];
-        for (int r = 0; r < 3; r++)
-          rhs.v[3 + r] += f * (&J_ang.x)[r];
-      }
-
-      // ---- Solve and apply ----
-      bool solve3x3ForBody = use3x3Solve && !bodyNeedsFull6x6;
-      if (!solve3x3ForBody) {
-        Vec6 delta = solveLDLT(lhs, rhs);
-        body.position -= delta.linear();
-        Quat dq(0, delta[3], delta[4], delta[5]);
-        body.rotation =
-            (body.rotation - dq * body.rotation * 0.5f).normalized();
-      } else {
-        Mat33 Alin, Aang;
-        Vec3 rhsLin(rhs[0], rhs[1], rhs[2]);
-        Vec3 rhsAng(rhs[3], rhs[4], rhs[5]);
-        for (int r = 0; r < 3; r++)
-          for (int c = 0; c < 3; c++) {
-            Alin.m[r][c] = lhs.m[r][c];
-            Aang.m[r][c] = lhs.m[3 + r][3 + c];
+        for (uint32_t ci : pipeline.contactBatches[ii]) {
+          auto &c = contacts[ci];
+          bool isA = (c.bodyA == bi);
+          bool isB = (c.bodyB == bi);
+          if (!isA && !isB)
+            continue;
+          computeConstraint(c);
+          for (int i = 0; i < 3; ++i) {
+            Vec6 J = isA ? (i == 0 ? c.JA : (i == 1 ? c.JAt1 : c.JAt2))
+                         : (i == 0 ? c.JB : (i == 1 ? c.JBt1 : c.JBt2));
+            float pen = std::max(c.penalty[i], boostFloor);
+            float f = std::max(c.fmin[i], std::min(c.fmax[i], pen * c.C[i] + c.lambda[i]));
+            rhs += J * f;
+            lhs += outer(J, J * pen);
           }
-        Vec3 deltaPos = Alin.inverse() * rhsLin;
-        Vec3 deltaTheta = Aang.inverse() * rhsAng;
-        body.position -= deltaPos;
-        Quat dq(0, deltaTheta.x, deltaTheta.y, deltaTheta.z);
-        body.rotation =
-            (body.rotation - dq * body.rotation * 0.5f).normalized();
-      }
-    }
-
-    // ---- Dual update ----
-    // Contact dual
-    for (auto &c : contacts) {
-      computeConstraint(c);
-      for (int i = 0; i < 3; i++) {
-        float oldLambda = c.lambda[i];
-        float rawLambda = c.penalty[i] * c.C[i] + oldLambda;
-        c.lambda[i] = std::max(c.fmin[i], std::min(c.fmax[i], rawLambda));
-        if (c.lambda[i] < c.fmax[i] && c.lambda[i] > c.fmin[i])
-          c.penalty[i] =
-              std::min(c.penalty[i] + beta * fabsf(c.C[i]), PENALTY_MAX);
-      }
-    }
-
-    // Joint dual (unified D6)
-    {
-      const float lambdaDecay = 0.99f;
-      for (auto &jnt : d6Joints) {
-        updateD6Dual(jnt, bodies, dt, lambdaDecay);
-      }
-    }
-
-    // Gear joint dual (inside iteration loop, matching PhysX)
-    {
-      const float lambdaDecay = 0.99f;
-      for (auto &gnt : gearJoints) {
-        if (gnt.bodyA >= (uint32_t)bodies.size() ||
-            gnt.bodyB >= (uint32_t)bodies.size())
-          continue;
-        Body &bA = bodies[gnt.bodyA];
-        Body &bB = bodies[gnt.bodyB];
-        if (bA.mass <= 0.f || bB.mass <= 0.f)
-          continue;
-
-        float mA = bA.mass, mB = bB.mass;
-        float mEff2 = (mA > 0.f && mB > 0.f) ? std::min(mA, mB) : std::max(mA, mB);
-        float Mh2 = mEff2 / dt2;
-        float admm_step = gnt.rho * gnt.rho / (gnt.rho + Mh2);
-        float rhoDual = std::min(Mh2, admm_step);
-
-        Vec3 worldAxisA = bA.rotation.rotate(gnt.axisA);
-        Vec3 worldAxisB = bB.rotation.rotate(gnt.axisB);
-        Vec3 dwA = bA.deltaWInitial();
-        Vec3 dwB = bB.deltaWInitial();
-        float C = dwA.dot(worldAxisA) * gnt.gearRatio + dwB.dot(worldAxisB);
-
-        gnt.lambdaGear = gnt.lambdaGear * lambdaDecay + rhoDual * C;
-      }
-    }
-
-    // Articulation dual
-    {
-      const float lambdaDecay = 0.99f;
-      for (auto &artic : articulations) {
-        for (int ji = 0; ji < (int)artic.joints.size(); ji++) {
-          updateArticulationDual(artic, ji, bodies, dt, lambdaDecay);
         }
-        for (int mi = 0; mi < (int)artic.mimicJoints.size(); mi++) {
-          updateMimicDual(artic, mi, bodies, dt, lambdaDecay);
+
+        for (uint32_t ji : pipeline.islands[ii].d6Joints)
+          addD6Contribution(d6Joints[ji], bi, bodies, dt, lhs, rhs);
+
+        for (uint32_t ai : pipeline.islands[ii].articulations) {
+          const auto &artic = articulations[ai];
+          for (int ji = 0; ji < (int)artic.joints.size(); ++ji)
+            addArticulationContribution(artic, ji, bi, bodies, dt, lhs, rhs);
+          for (int mi = 0; mi < (int)artic.mimicJoints.size(); ++mi)
+            addMimicJointContribution(artic, mi, bi, bodies, dt, lhs, rhs);
+          for (int ti = 0; ti < (int)artic.ikTargets.size(); ++ti)
+            addIKTargetContribution(artic, ti, bi, bodies, dt, lhs, rhs);
         }
-        for (int ti = 0; ti < (int)artic.ikTargets.size(); ti++) {
-          updateIKTargetDual(artic, ti, bodies, dt, lambdaDecay);
+
+        for (uint32_t gi : pipeline.islands[ii].gearJoints) {
+          auto &gnt = gearJoints[gi];
+          bool isA = (gnt.bodyA == bi), isB = (gnt.bodyB == bi);
+          if (!isA && !isB)
+            continue;
+          if (gnt.bodyA >= bodies.size() || gnt.bodyB >= bodies.size())
+            continue;
+          Body &bA = bodies[gnt.bodyA];
+          Body &bB = bodies[gnt.bodyB];
+          if (bA.mass <= 0.f || bB.mass <= 0.f)
+            continue;
+          Vec3 worldAxisA = bA.rotation.rotate(gnt.axisA);
+          Vec3 worldAxisB = bB.rotation.rotate(gnt.axisB);
+          Vec3 dwA = bA.deltaWInitial();
+          Vec3 dwB = bB.deltaWInitial();
+          float C = dwA.dot(worldAxisA) * gnt.gearRatio + dwB.dot(worldAxisB);
+          float effectiveRho = std::max(gnt.rho, body.mass / dt2);
+          Vec3 J_ang = isA ? (worldAxisA * gnt.gearRatio) : worldAxisB;
+          float f = effectiveRho * C + gnt.lambdaGear;
+          for (int r = 0; r < 3; r++)
+            for (int c2 = 0; c2 < 3; c2++)
+              lhs.m[3 + r][3 + c2] += effectiveRho * (&J_ang.x)[r] * (&J_ang.x)[c2];
+          for (int r = 0; r < 3; r++)
+            rhs.v[3 + r] += f * (&J_ang.x)[r];
+        }
+
+        bool solve3x3ForBody = use3x3Solve && !bodyNeedsFull6x6;
+        if (!solve3x3ForBody) {
+          Vec6 delta = solveLDLT(lhs, rhs);
+          body.position -= delta.linear();
+          Quat dq(0, delta[3], delta[4], delta[5]);
+          body.rotation = (body.rotation - dq * body.rotation * 0.5f).normalized();
+        } else {
+          Mat33 Alin, Aang;
+          Vec3 rhsLin(rhs[0], rhs[1], rhs[2]);
+          Vec3 rhsAng(rhs[3], rhs[4], rhs[5]);
+          for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++) {
+              Alin.m[r][c] = lhs.m[r][c];
+              Aang.m[r][c] = lhs.m[3 + r][3 + c];
+            }
+          Vec3 deltaPos = Alin.inverse() * rhsLin;
+          Vec3 deltaTheta = Aang.inverse() * rhsAng;
+          body.position -= deltaPos;
+          Quat dq(0, deltaTheta.x, deltaTheta.y, deltaTheta.z);
+          body.rotation = (body.rotation - dq * body.rotation * 0.5f).normalized();
         }
       }
     }
 
-    // ===================================================================
-    // Anderson Acceleration (Type I, safeguarded)
-    // ===================================================================
-    if (useAndersonAccel && it >= 0) {
+    stageDualUpdate(dt2);
+
+    if (useAndersonAccel) {
       std::vector<float> postState;
       packState(postState);
-
-      // Compute residual f_k = g(x_k) - x_k
       std::vector<float> fk(aaDim);
-      for (int i = 0; i < aaDim; i++)
+      for (int i = 0; i < aaDim; ++i)
         fk[i] = postState[i] - preState[i];
-
-      // Store in circular buffer
       int slot = aaCount % aaWindowSize;
       aaXHistory[slot] = preState;
       aaFHistory[slot] = fk;
       aaCount++;
-
-      int mk = std::min(aaCount - 1, aaWindowSize); // number of differences
+      int mk = std::min(aaCount - 1, aaWindowSize);
       if (mk >= 1) {
-        // Build ΔF matrix columns: ΔF_j = f_k - f_{k-j}
-        // We have: slot = most recent, (slot-1+ws)%ws = one before, etc.
         std::vector<std::vector<float>> deltaF(mk, std::vector<float>(aaDim));
         std::vector<std::vector<float>> deltaX(mk, std::vector<float>(aaDim));
-        for (int j = 0; j < mk; j++) {
+        for (int j = 0; j < mk; ++j) {
           int prevSlot = (slot - 1 - j + aaWindowSize * 2) % aaWindowSize;
-          for (int i = 0; i < aaDim; i++) {
+          for (int i = 0; i < aaDim; ++i) {
             deltaF[j][i] = fk[i] - aaFHistory[prevSlot][i];
             deltaX[j][i] = preState[i] - aaXHistory[prevSlot][i];
           }
         }
-
-        // Solve normal equations: (ΔF^T ΔF) θ = ΔF^T f_k
-        std::vector<float> FTF(mk * mk, 0.0f);
-        std::vector<float> FTf(mk, 0.0f);
-        for (int i = 0; i < mk; i++) {
-          for (int j = 0; j <= i; j++) {
+        std::vector<float> FTF(mk * mk, 0.0f), FTf(mk, 0.0f), theta(mk, 0.0f);
+        for (int i = 0; i < mk; ++i) {
+          for (int j = 0; j <= i; ++j) {
             float dot = 0;
-            for (int d = 0; d < aaDim; d++)
+            for (int d = 0; d < aaDim; ++d)
               dot += deltaF[i][d] * deltaF[j][d];
-            FTF[i * mk + j] = dot;
-            FTF[j * mk + i] = dot;
+            FTF[i * mk + j] = FTF[j * mk + i] = dot;
           }
-          float dot = 0;
-          for (int d = 0; d < aaDim; d++)
-            dot += deltaF[i][d] * fk[d];
-          FTf[i] = dot;
+          for (int d = 0; d < aaDim; ++d)
+            FTf[i] += deltaF[i][d] * fk[d];
         }
-
-        // Tikhonov regularization
         float maxDiag = 0;
-        for (int i = 0; i < mk; i++)
+        for (int i = 0; i < mk; ++i)
           maxDiag = std::max(maxDiag, FTF[i * mk + i]);
         float reg = 1e-8f * std::max(maxDiag, 1.0f);
-        for (int i = 0; i < mk; i++)
+        for (int i = 0; i < mk; ++i)
           FTF[i * mk + i] += reg;
-
-        // Gaussian elimination (mk ≤ 3, tiny system)
-        std::vector<float> theta(mk, 0.0f);
-        for (int i = 0; i < mk; i++) {
+        for (int i = 0; i < mk; ++i) {
           float pivot = FTF[i * mk + i];
           if (std::fabs(pivot) < 1e-15f) continue;
-          for (int j = i + 1; j < mk; j++) {
+          for (int j = i + 1; j < mk; ++j) {
             float factor = FTF[j * mk + i] / pivot;
-            for (int k = i + 1; k < mk; k++)
+            for (int k = i + 1; k < mk; ++k)
               FTF[j * mk + k] -= factor * FTF[i * mk + k];
             FTf[j] -= factor * FTf[i];
           }
         }
-        for (int i = mk - 1; i >= 0; i--) {
+        for (int i = mk - 1; i >= 0; --i) {
           float sum = FTf[i];
-          for (int j = i + 1; j < mk; j++)
+          for (int j = i + 1; j < mk; ++j)
             sum -= FTF[i * mk + j] * theta[j];
           float pivot = FTF[i * mk + i];
           theta[i] = (std::fabs(pivot) > 1e-15f) ? (sum / pivot) : 0.0f;
         }
-
-        // Compute AA iterate: x_{k+1} = g(x_k) - ΔG * θ
-        //   where ΔG_j = (x_k + f_k) - (x_{k-j} + f_{k-j}) = ΔX_j + ΔF_j
         std::vector<float> aaState(aaDim);
-        for (int i = 0; i < aaDim; i++) {
+        for (int i = 0; i < aaDim; ++i) {
           float correction = 0;
-          for (int j = 0; j < mk; j++)
+          for (int j = 0; j < mk; ++j)
             correction += theta[j] * (deltaX[j][i] + deltaF[j][i]);
           aaState[i] = postState[i] - correction;
         }
-
-        // Safeguard: measure actual constraint violation before/after AA
         float violBefore = 0;
         for (auto &artic : articulations)
           violBefore = std::max(violBefore, artic.computeMaxPositionViolation(bodies));
-
-        // Tentatively apply AA state
         unpackState(aaState);
-
         float violAfter = 0;
         for (auto &artic : articulations)
           violAfter = std::max(violAfter, artic.computeMaxPositionViolation(bodies));
-
-        // Reject if AA increased violation
-        if (violAfter > violBefore) {
+        if (violAfter > violBefore)
           unpackState(postState);
-        }
       }
     }
 
-    // ===================================================================
-    // Chebyshev semi-iterative position relaxation
-    //
-    // x_{k+1}^cheb = x_{k-1} + omega_k * (x_{k+1}^GS - x_{k-1})
-    // omega follows the Chebyshev recurrence for spectral radius rho.
-    // ===================================================================
     if (useChebyshev && it >= 2) {
-      // Chebyshev omega recurrence
       float rhoSq = chebyshevSpectralRadius * chebyshevSpectralRadius;
-      if (it == 2) {
-        chebyOmega = 2.0f / (2.0f - rhoSq);
-      } else {
-        chebyOmega = 1.0f / (1.0f - rhoSq * chebyOmega / 4.0f);
-      }
-      chebyOmega = std::max(1.0f, std::min(chebyOmega, 2.0f)); // safety clamp
-
-      for (uint32_t i = 0; i < nBodies; i++) {
+      chebyOmega = (it == 2) ? (2.0f / (2.0f - rhoSq))
+                             : (1.0f / (1.0f - rhoSq * chebyOmega / 4.0f));
+      chebyOmega = std::max(1.0f, std::min(chebyOmega, 2.0f));
+      for (uint32_t i = 0; i < bodies.size(); ++i) {
         if (bodies[i].mass <= 0) continue;
-        // Relaxed position: x_new = x_{k-1} + omega * (x_GS - x_{k-1})
         bodies[i].position = chebyPrevPrevPos[i] +
             (bodies[i].position - chebyPrevPrevPos[i]) * chebyOmega;
-        // For rotation: use SLERP-like interpolation via quaternion blend
-        // Approximate: q_new ≈ normalize(q_{k-1} + omega * (q_GS - q_{k-1}))
         Quat qPrev = chebyPrevPrevRot[i];
         Quat qCur = bodies[i].rotation;
         float dotQ = qPrev.w * qCur.w + qPrev.x * qCur.x +
                      qPrev.y * qCur.y + qPrev.z * qCur.z;
         if (dotQ < 0) qCur = qCur * (-1.0f);
-        Quat qBlend;
-        qBlend.w = qPrev.w + chebyOmega * (qCur.w - qPrev.w);
-        qBlend.x = qPrev.x + chebyOmega * (qCur.x - qPrev.x);
-        qBlend.y = qPrev.y + chebyOmega * (qCur.y - qPrev.y);
-        qBlend.z = qPrev.z + chebyOmega * (qCur.z - qPrev.z);
+        Quat qBlend(qPrev.w + chebyOmega * (qCur.w - qPrev.w),
+                    qPrev.x + chebyOmega * (qCur.x - qPrev.x),
+                    qPrev.y + chebyOmega * (qCur.y - qPrev.y),
+                    qPrev.z + chebyOmega * (qCur.z - qPrev.z));
         bodies[i].rotation = qBlend.normalized();
       }
     }
 
-    // ===================================================================
-    // Convergence tracking
-    // ===================================================================
     if (!articulations.empty()) {
       float maxViol = 0;
       for (const auto &artic : articulations)
         maxViol = std::max(maxViol, artic.computeMaxPositionViolation(bodies));
       convergenceHistory.push_back(maxViol);
     }
-  } // end iteration loop
+  }
+}
 
-  // =========================================================================
-  // Post-solve motor drives (matches PhysX Stage 5b)
-  //
-  // After all constraint iterations converge, directly apply clamped torque
-  // to bodies. This avoids coupling the motor with position/gear constraints
-  // in the Hessian which causes ADMM oscillation.
-  // =========================================================================
+void Solver::stageDualUpdate(float dt2) {
+  tasks().parallelFor({0u, (uint32_t)contacts.size()}, [&](TaskRange range) {
+    for (uint32_t ci = range.begin; ci < range.end; ++ci) {
+      auto &c = contacts[ci];
+      computeConstraint(c);
+      for (int i = 0; i < 3; i++) {
+        float oldLambda = c.lambda[i];
+        float rawLambda = c.penalty[i] * c.C[i] + oldLambda;
+        c.lambda[i] = std::max(c.fmin[i], std::min(c.fmax[i], rawLambda));
+        if (c.lambda[i] < c.fmax[i] && c.lambda[i] > c.fmin[i])
+          c.penalty[i] = std::min(c.penalty[i] + beta * fabsf(c.C[i]), PENALTY_MAX);
+      }
+    }
+  });
+
+  for (const auto &graph : pipeline.constraintGraphs) {
+    for (const auto &colorBatch : graph.colors) {
+      for (uint32_t nodeIdx : colorBatch) {
+        const auto &node = graph.nodes[nodeIdx];
+        switch (node.type) {
+        case ConstraintGraph::Node::ContactNode:
+          break;
+        case ConstraintGraph::Node::D6Node:
+          updateD6Dual(d6Joints[node.index0], bodies, dt, 0.99f);
+          break;
+        case ConstraintGraph::Node::GearNode: {
+          auto &gnt = gearJoints[node.index0];
+          if (gnt.bodyA >= bodies.size() || gnt.bodyB >= bodies.size())
+            break;
+          Body &bA = bodies[gnt.bodyA];
+          Body &bB = bodies[gnt.bodyB];
+          if (bA.mass <= 0.f || bB.mass <= 0.f)
+            break;
+          float mA = bA.mass, mB = bB.mass;
+          float mEff2 = (mA > 0.f && mB > 0.f) ? std::min(mA, mB) : std::max(mA, mB);
+          float Mh2 = mEff2 / dt2;
+          float admm_step = gnt.rho * gnt.rho / (gnt.rho + Mh2);
+          float rhoDual = std::min(Mh2, admm_step);
+          Vec3 worldAxisA = bA.rotation.rotate(gnt.axisA);
+          Vec3 worldAxisB = bB.rotation.rotate(gnt.axisB);
+          Vec3 dwA = bA.deltaWInitial();
+          Vec3 dwB = bB.deltaWInitial();
+          float C = dwA.dot(worldAxisA) * gnt.gearRatio + dwB.dot(worldAxisB);
+          gnt.lambdaGear = gnt.lambdaGear * 0.99f + rhoDual * C;
+          break;
+        }
+        case ConstraintGraph::Node::ArticulationJointNode:
+          updateArticulationDual(articulations[node.index0], (int)node.index1, bodies, dt, 0.99f);
+          break;
+        case ConstraintGraph::Node::MimicNode:
+          updateMimicDual(articulations[node.index0], (int)node.index1, bodies, dt, 0.99f);
+          break;
+        case ConstraintGraph::Node::IKNode:
+          updateIKTargetDual(articulations[node.index0], (int)node.index1, bodies, dt, 0.99f);
+          break;
+        }
+      }
+    }
+  }
+}
+
+void Solver::applyPostSolveMotors(float invDt, float dt2) {
   for (auto &jnt : d6Joints) {
     if (!jnt.motorEnabled || jnt.motorMaxForce <= 0.0f)
       continue;
-
     bool isAStatic = (jnt.bodyA == UINT32_MAX || jnt.bodyA >= (uint32_t)bodies.size());
     bool isBStatic = (jnt.bodyB == UINT32_MAX || jnt.bodyB >= (uint32_t)bodies.size());
     if (isAStatic && isBStatic)
       continue;
-
-    // Twist axis = X-axis of localFrameA in world space
     Quat rotA_m = isAStatic ? Quat() : bodies[jnt.bodyA].rotation;
     Vec3 worldAxis = (rotA_m * jnt.localFrameA).rotate(Vec3(1, 0, 0));
     float axLen = worldAxis.length();
     if (axLen > 1e-6f) worldAxis = worldAxis * (1.0f / axLen);
-
-    // Apply motor to body B
     if (!isBStatic) {
       Body &bodyB = bodies[jnt.bodyB];
-
-      // Current angular velocity from position-level solver
       Quat deltaQB = bodyB.rotation * bodyB.initialRotation.conjugate();
       if (deltaQB.w < 0.0f) deltaQB = deltaQB * (-1.0f);
       Vec3 currentAngVel = Vec3(deltaQB.x, deltaQB.y, deltaQB.z) * (2.0f * invDt);
-      float currentAxisVel = currentAngVel.dot(worldAxis);
-
-      float velocityError = jnt.motorTargetVelocity - currentAxisVel;
-
-      // Effective inertia along twist axis
+      float velocityError = jnt.motorTargetVelocity - currentAngVel.dot(worldAxis);
       Vec3 invITimesAxis = bodyB.invInertiaWorld * worldAxis;
       float effectiveInvInertia = worldAxis.dot(invITimesAxis);
-      if (effectiveInvInertia < 1e-10f)
-        continue;
-
-      float effectiveInertia = 1.0f / effectiveInvInertia;
-      float requiredTorque = effectiveInertia * velocityError * invDt;
-      float clampedTorque = std::max(-jnt.motorMaxForce,
-                                     std::min(jnt.motorMaxForce, requiredTorque));
-      float angularAccel = clampedTorque * effectiveInvInertia;
-      float deltaAngle = angularAccel * dt2;
-
-      // Apply rotation to body B (axis-angle -> quaternion)
-      float ha = deltaAngle * 0.5f;
-      float sinHa = sinf(ha), cosHa = cosf(ha);
-      Quat dRot(cosHa, worldAxis.x * sinHa, worldAxis.y * sinHa,
-                worldAxis.z * sinHa);
-      bodyB.rotation = (dRot * bodyB.rotation).normalized();
+      if (effectiveInvInertia >= 1e-10f) {
+        float requiredTorque = velocityError * invDt / effectiveInvInertia;
+        float clampedTorque = std::max(-jnt.motorMaxForce, std::min(jnt.motorMaxForce, requiredTorque));
+        float deltaAngle = clampedTorque * effectiveInvInertia * dt2;
+        float ha = deltaAngle * 0.5f;
+        Quat dRot(cosf(ha), worldAxis.x * sinf(ha), worldAxis.y * sinf(ha), worldAxis.z * sinf(ha));
+        bodyB.rotation = (dRot * bodyB.rotation).normalized();
+      }
     }
-
-    // Apply opposite rotation to body A if dynamic
     if (!isAStatic) {
       Body &bodyA = bodies[jnt.bodyA];
-
       Quat deltaQA = bodyA.rotation * bodyA.initialRotation.conjugate();
       if (deltaQA.w < 0.0f) deltaQA = deltaQA * (-1.0f);
       Vec3 currentAngVelA = Vec3(deltaQA.x, deltaQA.y, deltaQA.z) * (2.0f * invDt);
-      float currentAxisVelA = currentAngVelA.dot(worldAxis);
-      float velocityErrorA = -jnt.motorTargetVelocity - currentAxisVelA;
-
+      float velocityErrorA = -jnt.motorTargetVelocity - currentAngVelA.dot(worldAxis);
       Vec3 invITimesAxisA = bodyA.invInertiaWorld * worldAxis;
       float effectiveInvInertiaA = worldAxis.dot(invITimesAxisA);
       if (effectiveInvInertiaA > 1e-10f) {
-        float effectiveInertiaA = 1.0f / effectiveInvInertiaA;
-        float requiredTorqueA = effectiveInertiaA * velocityErrorA * invDt;
-        float clampedTorqueA = std::max(-jnt.motorMaxForce,
-                                        std::min(jnt.motorMaxForce, requiredTorqueA));
-        float deltaAngleA = clampedTorqueA * effectiveInvInertiaA * dt2;
-        float haA = deltaAngleA * 0.5f;
-        float sinHaA = sinf(haA), cosHaA = cosf(haA);
-        Quat dRotA(cosHaA, worldAxis.x * sinHaA, worldAxis.y * sinHaA,
-                   worldAxis.z * sinHaA);
+        float requiredTorqueA = velocityErrorA * invDt / effectiveInvInertiaA;
+        float clampedTorqueA = std::max(-jnt.motorMaxForce, std::min(jnt.motorMaxForce, requiredTorqueA));
+        float haA = clampedTorqueA * effectiveInvInertiaA * dt2 * 0.5f;
+        Quat dRotA(cosf(haA), worldAxis.x * sinf(haA), worldAxis.y * sinf(haA), worldAxis.z * sinf(haA));
         bodyA.rotation = (dRotA * bodyA.rotation).normalized();
       }
     }
   }
+}
 
-  // Update velocities
-  for (auto &body : bodies) {
-    if (body.mass <= 0)
-      continue;
-    body.prevLinearVelocity = body.linearVelocity;
-    body.linearVelocity = (body.position - body.initialPosition) * invDt;
-    Quat dq = body.rotation * body.initialRotation.conjugate();
-    if (dq.w < 0)
-      dq = -dq;
-    body.angularVelocity = Vec3(dq.x, dq.y, dq.z) * (2.0f * invDt);
+void Solver::stageVelocityWriteback(float invDt) {
+  tasks().parallelFor({0u, (uint32_t)bodies.size()}, [&](TaskRange range) {
+    for (uint32_t bi = range.begin; bi < range.end; ++bi) {
+      auto &body = bodies[bi];
+      if (body.mass <= 0)
+        continue;
+      body.prevLinearVelocity = body.linearVelocity;
+      body.linearVelocity = (body.position - body.initialPosition) * invDt;
+      Quat dq = body.rotation * body.initialRotation.conjugate();
+      if (dq.w < 0)
+        dq = -dq;
+      body.angularVelocity = Vec3(dq.x, dq.y, dq.z) * (2.0f * invDt);
+      if (body.linearDamping > 0.0f) {
+        float decay = std::max(0.0f, 1.0f - body.linearDamping * dt);
+        body.linearVelocity = body.linearVelocity * decay;
+      }
+      if (body.angularDamping > 0.0f) {
+        float decay = std::max(0.0f, 1.0f - body.angularDamping * dt);
+        body.angularVelocity = body.angularVelocity * decay;
+      }
+      float linSpeed = body.linearVelocity.length();
+      if (linSpeed > body.maxLinearVelocity)
+        body.linearVelocity = body.linearVelocity * (body.maxLinearVelocity / linSpeed);
+      float angSpeed = body.angularVelocity.length();
+      if (angSpeed > body.maxAngularVelocity)
+        body.angularVelocity = body.angularVelocity * (body.maxAngularVelocity / angSpeed);
+    }
+  });
+}
 
-    // Per-body damping
-    if (body.linearDamping > 0.0f) {
-      float decay = std::max(0.0f, 1.0f - body.linearDamping * dt);
-      body.linearVelocity = body.linearVelocity * decay;
-    }
-    if (body.angularDamping > 0.0f) {
-      float decay = std::max(0.0f, 1.0f - body.angularDamping * dt);
-      body.angularVelocity = body.angularVelocity * decay;
-    }
-
-    // Velocity clamping
-    float linSpeed = body.linearVelocity.length();
-    if (linSpeed > body.maxLinearVelocity) {
-      body.linearVelocity = body.linearVelocity * (body.maxLinearVelocity / linSpeed);
-    }
-    float angSpeed = body.angularVelocity.length();
-    if (angSpeed > body.maxAngularVelocity) {
-      body.angularVelocity = body.angularVelocity * (body.maxAngularVelocity / angSpeed);
-    }
-  }
+void Solver::step(float dt_) {
+  dt = dt_;
+  float invDt = 1.0f / dt;
+  float dt2 = dt * dt;
+  warmstart();
+  stagePredictionAndInertia(invDt, dt2);
+  stageBuildAdjacency();
+  stagePropagateMass(dt2);
+  stageComputeContactC0();
+  stageBuildIslands();
+  stageBuildContactBatches();
+  stageBuildConstraintGraphs();
+  stageBuildSweepOrders();
+  stagePrimalSolve(invDt, dt2);
+  applyPostSolveMotors(invDt, dt2);
+  stageVelocityWriteback(invDt);
 }
 
 } // namespace AvbdRef
