@@ -11,6 +11,18 @@ namespace AvbdRef {
 
 namespace {
 
+inline bool shouldSortConstraints(const Solver &solver) {
+  return solver.runtimeConfig().hasDeterminismFlag(DeterminismFlags::eSORT_CONSTRAINTS);
+}
+
+inline bool shouldSortBodies(const Solver &solver) {
+  return solver.runtimeConfig().hasDeterminismFlag(DeterminismFlags::eSORT_BODIES);
+}
+
+inline bool shouldSortIslands(const Solver &solver) {
+  return solver.runtimeConfig().hasDeterminismFlag(DeterminismFlags::eSORT_ISLANDS);
+}
+
 inline void syncBodyStateToAoS(Solver &solver, uint32_t bodyIndex) {
   if (bodyIndex < solver.bodies.size())
     solver.storage.bodies.scatterBodyToAoS(solver.bodies, bodyIndex);
@@ -306,11 +318,17 @@ uint32_t Solver::addBody(Vec3 pos, Quat rot, Vec3 halfExtent, float density,
 
   uint32_t idx = (uint32_t)bodies.size();
   bodies.push_back(b);
+  sleepSystem.resize(bodies.size());
+  sleepSystem.wake(idx);
   return idx;
 }
 
 void Solver::addContact(uint32_t bodyA, uint32_t bodyB, Vec3 normal, Vec3 rA,
                         Vec3 rB, float depth, float fric) {
+  if (bodyA < bodies.size())
+    sleepSystem.wake(bodyA);
+  if (bodyB < bodies.size())
+    sleepSystem.wake(bodyB);
   ContactPrep::ContactMaterial material;
   material.dynamicFriction = fric;
   const float separation = -depth;
@@ -531,6 +549,12 @@ void Solver::stageBuildAdjacency() {
       addEdge(parent, child);
     }
   }
+  if (shouldSortBodies(*this)) {
+    for (auto &neighbors : pipeline.adjacency) {
+      std::sort(neighbors.begin(), neighbors.end());
+      neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
+    }
+  }
 }
 
 void Solver::stagePropagateMass(float dt2) {
@@ -653,6 +677,29 @@ void Solver::stageBuildIslands() {
         pipeline.islands[island].articulationBodies.push_back(j.bodyIndex);
     }
   }
+
+  if (shouldSortBodies(*this)) {
+    for (auto &island : pipeline.islands) {
+      std::sort(island.bodies.begin(), island.bodies.end());
+      std::sort(island.articulationBodies.begin(), island.articulationBodies.end());
+      island.articulationBodies.erase(std::unique(island.articulationBodies.begin(), island.articulationBodies.end()), island.articulationBodies.end());
+    }
+  }
+  if (shouldSortConstraints(*this)) {
+    for (auto &island : pipeline.islands) {
+      std::sort(island.contacts.begin(), island.contacts.end());
+      std::sort(island.d6Joints.begin(), island.d6Joints.end());
+      std::sort(island.gearJoints.begin(), island.gearJoints.end());
+      std::sort(island.articulations.begin(), island.articulations.end());
+    }
+  }
+  if (shouldSortIslands(*this)) {
+    std::sort(pipeline.islands.begin(), pipeline.islands.end(), [](const Solver::IslandData &a, const Solver::IslandData &b) {
+      const uint32_t aKey = a.bodies.empty() ? UINT32_MAX : a.bodies.front();
+      const uint32_t bKey = b.bodies.empty() ? UINT32_MAX : b.bodies.front();
+      return aKey < bKey;
+    });
+  }
 }
 
 void Solver::stageBuildContactBatches() {
@@ -771,7 +818,8 @@ void Solver::stageBuildSweepOrders() {
     for (uint32_t bi : island.articulationBodies)
       if (bi < bodies.size())
         order.push_back(bi);
-    std::sort(order.begin(), order.end());
+    if (shouldSortBodies(*this))
+      std::sort(order.begin(), order.end());
     order.erase(std::unique(order.begin(), order.end()), order.end());
   }
 }
@@ -838,6 +886,9 @@ void Solver::stagePrimalSolve(float invDt, float dt2) {
 
       for (uint32_t bi : order) {
         if (storage.bodies.mass[bi] <= 0)
+          continue;
+        if (runtimeConfig().hasExecutionFlag(ExecutionFlags::eENABLE_SLEEPING) &&
+            sleepSystem.isSleeping(bi))
           continue;
         Body &body = bodies[bi];
 
@@ -1213,29 +1264,16 @@ void Solver::stageVelocityWriteback(float invDt) {
 }
 
 void Solver::step(float dt_) {
-  using Clock = std::chrono::steady_clock;
-  auto msSince = [](const Clock::time_point &start) {
-    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-  };
+  ProfileScope frameScope(runtimeConfig().hasExecutionFlag(ExecutionFlags::eENABLE_PROFILING) ? &profiler : nullptr, "Solver.step");
   dt = dt_;
   float invDt = 1.0f / dt;
   float dt2 = dt * dt;
-  lastStepStats = StepStats{};
-  lastStepStats.bodyCount = (uint32_t)bodies.size();
-  lastStepStats.contactCount = (uint32_t)contacts.size();
-  lastStepStats.d6JointCount = (uint32_t)d6Joints.size();
-  lastStepStats.gearJointCount = (uint32_t)gearJoints.size();
-  lastStepStats.articulationCount = (uint32_t)articulations.size();
-  lastStepStats.constraintCount = lastStepStats.contactCount +
-                                  lastStepStats.d6JointCount +
-                                  lastStepStats.gearJointCount;
-  for (const auto &artic : articulations)
-    lastStepStats.constraintCount += (uint32_t)artic.joints.size() +
-                                     (uint32_t)artic.mimicJoints.size() +
-                                     (uint32_t)artic.ikTargets.size();
-  lastStepStats.primalIterations = (uint32_t)std::max(iterations, 0);
-
-  auto t0 = Clock::now();
+  runtime.stats().reset();
+  runtime.stats().numBodies = (uint32_t)bodies.size();
+  runtime.stats().numContacts = (uint32_t)contacts.size();
+  runtime.stats().numJoints = (uint32_t)(d6Joints.size() + gearJoints.size());
+  runtime.stats().totalIterations = (uint32_t)iterations;
+  sleepSystem.beginStep(bodies);
   storage.buildFromScene(bodies, contacts, d6Joints, gearJoints, articulations);
   lastStepStats.aosToSoABuildMs = msSince(t0);
   warmstart();
@@ -1245,8 +1283,7 @@ void Solver::step(float dt_) {
   stageComputeContactC0();
   t0 = Clock::now();
   stageBuildIslands();
-  lastStepStats.stageBuildIslandsMs = msSince(t0);
-  lastStepStats.islandCount = (uint32_t)pipeline.islands.size();
+  runtime.stats().numIslands = (uint32_t)pipeline.islands.size();
   stageBuildContactBatches();
   stageBuildConstraintGraphs();
   stageBuildSweepOrders();
@@ -1260,7 +1297,10 @@ void Solver::step(float dt_) {
   lastStepStats.writebackMs = msSince(t0);
   t0 = Clock::now();
   storage.scatterToScene(bodies, contacts);
-  lastStepStats.soaScatterMs = msSince(t0);
+  if (runtimeConfig().hasExecutionFlag(ExecutionFlags::eENABLE_SLEEPING))
+    sleepSystem.endStep(bodies, dt, runtimeConfig());
+  runtime.stats().numSleepingBodies = sleepSystem.sleepingCount();
+  runtime.stats().numActiveBodies = runtime.stats().numBodies - runtime.stats().numSleepingBodies;
 }
 
 } // namespace AvbdRef
