@@ -8,6 +8,23 @@
 
 namespace AvbdRef {
 
+namespace {
+
+inline void syncBodyStateToAoS(Solver &solver, uint32_t bodyIndex) {
+  if (bodyIndex < solver.bodies.size())
+    solver.storage.bodies.scatterBodyToAoS(solver.bodies, bodyIndex);
+}
+
+inline void syncAllBodyStateToAoS(Solver &solver) {
+  solver.storage.bodies.scatterToBodies(solver.bodies);
+}
+
+inline void syncContactsToAoS(Solver &solver) {
+  solver.storage.contacts.scatterToContacts(solver.contacts);
+}
+
+} // namespace
+
 // =============================================================================
 // Factory methods  all create D6Joint entries in the unified d6Joints vector
 // =============================================================================
@@ -310,6 +327,50 @@ void Solver::addContact(const ContactPrep::ContactRow &row) {
 // =============================================================================
 
 void Solver::computeConstraint(Contact &c) {
+  if (!storage.contacts.bodyA.empty()) {
+    uint32_t ci = (uint32_t)(&c - contacts.data());
+    auto &bodyState = storage.bodies;
+    auto &contactState = storage.contacts;
+    uint32_t bodyA = contactState.bodyA[ci];
+    bool bStatic = (contactState.bodyB[ci] == UINT32_MAX);
+    uint32_t bodyB = contactState.bodyB[ci];
+
+    Vec3 rAw = bodyState.rotation[bodyA].rotate(contactState.anchorA[ci]);
+    Vec3 rBw = bStatic ? Vec3() : bodyState.rotation[bodyB].rotate(contactState.anchorB[ci]);
+    Vec3 n = contactState.normal[ci];
+    Vec3 t1 = contactState.tangent0[ci];
+    Vec3 t2 = contactState.tangent1[ci];
+
+    c.JA = Vec6(n, rAw.cross(n));
+    c.JB = bStatic ? Vec6() : Vec6(Vec3() - n, Vec3() - rBw.cross(n));
+    c.JAt1 = Vec6(t1, rAw.cross(t1));
+    c.JBt1 = bStatic ? Vec6() : Vec6(Vec3() - t1, Vec3() - rBw.cross(t1));
+    c.JAt2 = Vec6(t2, rAw.cross(t2));
+    c.JBt2 = bStatic ? Vec6() : Vec6(Vec3() - t2, Vec3() - rBw.cross(t2));
+
+    Vec6 dpA(bodyState.position[bodyA] - bodyState.initialPosition[bodyA],
+             bodyState.deltaWInitial(bodyA));
+    Vec6 dpB;
+    if (!bStatic)
+      dpB = Vec6(bodyState.position[bodyB] - bodyState.initialPosition[bodyB],
+                 bodyState.deltaWInitial(bodyB));
+
+    contactState.C[ci][0] = contactState.C0[ci][0] * (1.0f - alpha) + dot(c.JA, dpA) + dot(c.JB, dpB);
+    contactState.C[ci][1] = contactState.C0[ci][1] * (1.0f - alpha) + dot(c.JAt1, dpA) + dot(c.JBt1, dpB);
+    contactState.C[ci][2] = contactState.C0[ci][2] * (1.0f - alpha) + dot(c.JAt2, dpA) + dot(c.JBt2, dpB);
+    for (int i = 0; i < 3; ++i)
+      c.C[i] = contactState.C[ci][i];
+    float frictionBound = fabsf(contactState.lambda[ci][0]) * contactState.friction[ci];
+    contactState.fmax[ci][1] = frictionBound;
+    contactState.fmin[ci][1] = -frictionBound;
+    contactState.fmax[ci][2] = frictionBound;
+    contactState.fmin[ci][2] = -frictionBound;
+    for (int i = 0; i < 3; ++i) {
+      c.fmin[i] = contactState.fmin[ci][i];
+      c.fmax[i] = contactState.fmax[ci][i];
+    }
+    return;
+  }
   Body &bA = bodies[c.bodyA];
   bool bStatic = (c.bodyB == UINT32_MAX);
   Body *pB = bStatic ? nullptr : &bodies[c.bodyB];
@@ -349,6 +410,31 @@ void Solver::computeConstraint(Contact &c) {
 }
 
 void Solver::computeC0(Contact &c) {
+  if (!storage.contacts.bodyA.empty()) {
+    uint32_t ci = (uint32_t)(&c - contacts.data());
+    auto &bodyState = storage.bodies;
+    auto &contactState = storage.contacts;
+    uint32_t bodyA = contactState.bodyA[ci];
+    bool bStatic = (contactState.bodyB[ci] == UINT32_MAX);
+    uint32_t bodyB = contactState.bodyB[ci];
+
+    Vec3 wA = bodyState.position[bodyA] + bodyState.rotation[bodyA].rotate(contactState.anchorA[ci]);
+    Vec3 wB = bStatic ? contactState.anchorB[ci]
+                      : (bodyState.position[bodyB] + bodyState.rotation[bodyB].rotate(contactState.anchorB[ci]));
+    float rawC0 = (wA - wB).dot(contactState.normal[ci]) - contactState.depth[ci];
+    const float c0Threshold = 0.05f;
+    const float c0MaxDepth  = 0.20f;
+    if (rawC0 < -c0Threshold) {
+      float t = std::clamp((c0MaxDepth + rawC0) / (c0MaxDepth - c0Threshold), 0.0f, 1.0f);
+      rawC0 *= t;
+    }
+    contactState.C0[ci][0] = rawC0;
+    contactState.C0[ci][1] = 0.0f;
+    contactState.C0[ci][2] = 0.0f;
+    for (int i = 0; i < 3; ++i)
+      c.C0[i] = contactState.C0[ci][i];
+    return;
+  }
   Body &bA = bodies[c.bodyA];
   bool bStatic = (c.bodyB == UINT32_MAX);
   Body *pB = bStatic ? nullptr : &bodies[c.bodyB];
@@ -380,9 +466,11 @@ void Solver::warmstart() {
     for (uint32_t ci = range.begin; ci < range.end; ++ci) {
       auto &c = contacts[ci];
       for (int i = 0; i < 3; i++) {
-        c.lambda[i] = c.lambda[i] * alpha * gamma;
-        c.penalty[i] =
-            std::max(PENALTY_MIN, std::min(PENALTY_MAX, c.penalty[i] * gamma));
+        storage.contacts.lambda[ci][i] = storage.contacts.lambda[ci][i] * alpha * gamma;
+        storage.contacts.penalty[ci][i] =
+            std::max(PENALTY_MIN, std::min(PENALTY_MAX, storage.contacts.penalty[ci][i] * gamma));
+        c.lambda[i] = storage.contacts.lambda[ci][i];
+        c.penalty[i] = storage.contacts.penalty[ci][i];
       }
     }
   });
@@ -392,17 +480,17 @@ void Solver::stagePredictionAndInertia(float invDt, float dt2) {
   tasks().parallelFor({0u, (uint32_t)bodies.size()}, [&](TaskRange range) {
     for (uint32_t bi = range.begin; bi < range.end; ++bi) {
       auto &body = bodies[bi];
-      if (body.mass <= 0)
+      if (storage.bodies.mass[bi] <= 0)
         continue;
-      body.updateInvInertiaWorld();
-      body.inertialPosition =
-          body.position + body.linearVelocity * dt + gravity * dt2;
-      Quat angVel(0, body.angularVelocity.x, body.angularVelocity.y,
-                  body.angularVelocity.z);
-      body.inertialRotation =
-          (body.rotation + angVel * body.rotation * (0.5f * dt)).normalized();
+      storage.bodies.updateInvInertiaWorld(bi);
+      storage.bodies.inertialPosition[bi] =
+          storage.bodies.position[bi] + storage.bodies.linearVelocity[bi] * dt + gravity * dt2;
+      Quat angVel(0, storage.bodies.angularVelocity[bi].x, storage.bodies.angularVelocity[bi].y,
+                  storage.bodies.angularVelocity[bi].z);
+      storage.bodies.inertialRotation[bi] =
+          (storage.bodies.rotation[bi] + angVel * storage.bodies.rotation[bi] * (0.5f * dt)).normalized();
 
-      Vec3 accel = (body.linearVelocity - body.prevLinearVelocity) * invDt;
+      Vec3 accel = (storage.bodies.linearVelocity[bi] - storage.bodies.prevLinearVelocity[bi]) * invDt;
       float gravLen = gravity.length();
       float accelWeight = 0.0f;
       if (gravLen > 1e-6f) {
@@ -410,11 +498,12 @@ void Solver::stagePredictionAndInertia(float invDt, float dt2) {
         accelWeight = std::max(0.0f, std::min(1.0f, accel.dot(gravDir) / gravLen));
       }
 
-      body.initialPosition = body.position;
-      body.initialRotation = body.rotation;
-      body.position = body.position + body.linearVelocity * dt +
+      storage.bodies.initialPosition[bi] = storage.bodies.position[bi];
+      storage.bodies.initialRotation[bi] = storage.bodies.rotation[bi];
+      storage.bodies.position[bi] = storage.bodies.position[bi] + storage.bodies.linearVelocity[bi] * dt +
                       gravity * (accelWeight * dt2);
-      body.rotation = body.inertialRotation;
+      storage.bodies.rotation[bi] = storage.bodies.inertialRotation[bi];
+      syncBodyStateToAoS(*this, bi);
     }
   });
 }
@@ -465,9 +554,9 @@ void Solver::stagePropagateMass(float dt2) {
   tasks().parallelFor({0u, (uint32_t)contacts.size()}, [&](TaskRange range) {
     for (uint32_t ci = range.begin; ci < range.end; ++ci) {
       auto &c = contacts[ci];
-      float augA = pipeline.propagatedMass[c.bodyA];
-      float augB = (c.bodyB != UINT32_MAX) ? pipeline.propagatedMass[c.bodyB] : 0.0f;
-      float massB = (c.bodyB != UINT32_MAX) ? bodies[c.bodyB].mass : 0.0f;
+      float augA = pipeline.propagatedMass[storage.contacts.bodyA[ci]];
+      float augB = (storage.contacts.bodyB[ci] != UINT32_MAX) ? pipeline.propagatedMass[storage.contacts.bodyB[ci]] : 0.0f;
+      float massB = (storage.contacts.bodyB[ci] != UINT32_MAX) ? storage.bodies.mass[storage.contacts.bodyB[ci]] : 0.0f;
       float effectiveMass, scale;
       if (c.bodyB != UINT32_MAX && massB > 0.0f) {
         effectiveMass = std::max(augA, augB);
@@ -477,8 +566,10 @@ void Solver::stagePropagateMass(float dt2) {
         scale = penaltyScale;
       }
       float penFloor = std::max(PENALTY_MIN, scale * effectiveMass / dt2);
-      for (int i = 0; i < 3; ++i)
-        c.penalty[i] = std::max(c.penalty[i], penFloor);
+      for (int i = 0; i < 3; ++i) {
+        storage.contacts.penalty[ci][i] = std::max(storage.contacts.penalty[ci][i], penFloor);
+        c.penalty[i] = storage.contacts.penalty[ci][i];
+      }
     }
   });
 }
@@ -567,6 +658,7 @@ void Solver::stageBuildContactBatches() {
   pipeline.contactBatches.assign(pipeline.islands.size(), {});
   for (size_t ii = 0; ii < pipeline.islands.size(); ++ii)
     pipeline.contactBatches[ii] = pipeline.islands[ii].contacts;
+  storage.rebuildPackedContactBatches(pipeline.contactBatches);
 }
 
 void Solver::stageBuildConstraintGraphs() {
@@ -695,15 +787,16 @@ void Solver::stagePrimalSolve(float invDt, float dt2) {
   auto packState = [&](std::vector<float> &state) {
     state.resize(aaDim);
     for (uint32_t i = 0; i < bodies.size(); i++) {
-      state[i * 3 + 0] = bodies[i].position.x;
-      state[i * 3 + 1] = bodies[i].position.y;
-      state[i * 3 + 2] = bodies[i].position.z;
+      state[i * 3 + 0] = storage.bodies.position[i].x;
+      state[i * 3 + 1] = storage.bodies.position[i].y;
+      state[i * 3 + 2] = storage.bodies.position[i].z;
     }
   };
   auto unpackState = [&](const std::vector<float> &state) {
     for (uint32_t i = 0; i < bodies.size(); i++) {
-      if (bodies[i].mass <= 0) continue;
-      bodies[i].position = Vec3(state[i * 3 + 0], state[i * 3 + 1], state[i * 3 + 2]);
+      if (storage.bodies.mass[i] <= 0) continue;
+      storage.bodies.position[i] = Vec3(state[i * 3 + 0], state[i * 3 + 1], state[i * 3 + 2]);
+      syncBodyStateToAoS(*this, i);
     }
   };
 
@@ -716,8 +809,8 @@ void Solver::stagePrimalSolve(float invDt, float dt2) {
     chebyPrevRot.resize(bodies.size());
     chebyPrevPrevRot.resize(bodies.size());
     for (uint32_t i = 0; i < bodies.size(); ++i) {
-      chebyPrevPos[i] = chebyPrevPrevPos[i] = bodies[i].position;
-      chebyPrevRot[i] = chebyPrevPrevRot[i] = bodies[i].rotation;
+      chebyPrevPos[i] = chebyPrevPrevPos[i] = storage.bodies.position[i];
+      chebyPrevRot[i] = chebyPrevPrevRot[i] = storage.bodies.rotation[i];
     }
   }
 
@@ -731,8 +824,8 @@ void Solver::stagePrimalSolve(float invDt, float dt2) {
       for (uint32_t i = 0; i < bodies.size(); ++i) {
         chebyPrevPrevPos[i] = chebyPrevPos[i];
         chebyPrevPrevRot[i] = chebyPrevRot[i];
-        chebyPrevPos[i] = bodies[i].position;
-        chebyPrevRot[i] = bodies[i].rotation;
+        chebyPrevPos[i] = storage.bodies.position[i];
+        chebyPrevRot[i] = storage.bodies.rotation[i];
       }
     }
 
@@ -743,9 +836,9 @@ void Solver::stagePrimalSolve(float invDt, float dt2) {
         std::reverse(order.begin(), order.end());
 
       for (uint32_t bi : order) {
-        Body &body = bodies[bi];
-        if (body.mass <= 0)
+        if (storage.bodies.mass[bi] <= 0)
           continue;
+        Body &body = bodies[bi];
 
         bool bodyNeedsFull6x6 = false;
         if (use3x3Solve) {
@@ -759,25 +852,38 @@ void Solver::stagePrimalSolve(float invDt, float dt2) {
           }
         }
 
-        Mat66 lhs = body.getMassMatrix() / dt2;
-        Vec6 disp(body.position - body.inertialPosition, body.deltaWInertial());
+        Mat66 lhs = storage.bodies.getMassMatrix(bi) / dt2;
+        Vec6 disp(storage.bodies.position[bi] - storage.bodies.inertialPosition[bi],
+                  storage.bodies.deltaWInertial(bi));
         Vec6 rhs = lhs * disp;
-        float boostFloor = contactBoostFraction * body.mass / dt2;
+        float boostFloor = contactBoostFraction * storage.bodies.mass[bi] / dt2;
 
-        for (uint32_t ci : pipeline.contactBatches[ii]) {
+        const auto &packedBatches = storage.packedContactBatches[ii];
+        auto accumulateContact = [&](uint32_t ci) {
           auto &c = contacts[ci];
-          bool isA = (c.bodyA == bi);
-          bool isB = (c.bodyB == bi);
+          bool isA = (storage.contacts.bodyA[ci] == bi);
+          bool isB = (storage.contacts.bodyB[ci] == bi);
           if (!isA && !isB)
-            continue;
+            return;
           computeConstraint(c);
           for (int i = 0; i < 3; ++i) {
             Vec6 J = isA ? (i == 0 ? c.JA : (i == 1 ? c.JAt1 : c.JAt2))
                          : (i == 0 ? c.JB : (i == 1 ? c.JBt1 : c.JBt2));
-            float pen = std::max(c.penalty[i], boostFloor);
-            float f = std::max(c.fmin[i], std::min(c.fmax[i], pen * c.C[i] + c.lambda[i]));
+            float pen = std::max(storage.contacts.penalty[ci][i], boostFloor);
+            float f = std::max(storage.contacts.fmin[ci][i],
+                               std::min(storage.contacts.fmax[ci][i],
+                                        pen * storage.contacts.C[ci][i] + storage.contacts.lambda[ci][i]));
             rhs += J * f;
             lhs += outer(J, J * pen);
+          }
+        };
+        for (const auto &batch : packedBatches) {
+          if (batch.count == SoA::PACK_WIDTH) {
+            for (uint32_t lane = 0; lane < SoA::PACK_WIDTH; ++lane)
+              accumulateContact(batch.indices[lane]);
+          } else {
+            for (uint32_t lane = 0; lane < batch.count; ++lane)
+              accumulateContact(batch.indices[lane]);
           }
         }
 
@@ -810,7 +916,7 @@ void Solver::stagePrimalSolve(float invDt, float dt2) {
           Vec3 dwA = bA.deltaWInitial();
           Vec3 dwB = bB.deltaWInitial();
           float C = dwA.dot(worldAxisA) * gnt.gearRatio + dwB.dot(worldAxisB);
-          float effectiveRho = std::max(gnt.rho, body.mass / dt2);
+          float effectiveRho = std::max(gnt.rho, storage.bodies.mass[bi] / dt2);
           Vec3 J_ang = isA ? (worldAxisA * gnt.gearRatio) : worldAxisB;
           float f = effectiveRho * C + gnt.lambdaGear;
           for (int r = 0; r < 3; r++)
@@ -823,9 +929,9 @@ void Solver::stagePrimalSolve(float invDt, float dt2) {
         bool solve3x3ForBody = use3x3Solve && !bodyNeedsFull6x6;
         if (!solve3x3ForBody) {
           Vec6 delta = solveLDLT(lhs, rhs);
-          body.position -= delta.linear();
+          storage.bodies.position[bi] -= delta.linear();
           Quat dq(0, delta[3], delta[4], delta[5]);
-          body.rotation = (body.rotation - dq * body.rotation * 0.5f).normalized();
+          storage.bodies.rotation[bi] = (storage.bodies.rotation[bi] - dq * storage.bodies.rotation[bi] * 0.5f).normalized();
         } else {
           Mat33 Alin, Aang;
           Vec3 rhsLin(rhs[0], rhs[1], rhs[2]);
@@ -837,10 +943,11 @@ void Solver::stagePrimalSolve(float invDt, float dt2) {
             }
           Vec3 deltaPos = Alin.inverse() * rhsLin;
           Vec3 deltaTheta = Aang.inverse() * rhsAng;
-          body.position -= deltaPos;
+          storage.bodies.position[bi] -= deltaPos;
           Quat dq(0, deltaTheta.x, deltaTheta.y, deltaTheta.z);
-          body.rotation = (body.rotation - dq * body.rotation * 0.5f).normalized();
+          storage.bodies.rotation[bi] = (storage.bodies.rotation[bi] - dq * storage.bodies.rotation[bi] * 0.5f).normalized();
         }
+        syncBodyStateToAoS(*this, bi);
       }
     }
 
@@ -926,11 +1033,11 @@ void Solver::stagePrimalSolve(float invDt, float dt2) {
                              : (1.0f / (1.0f - rhoSq * chebyOmega / 4.0f));
       chebyOmega = std::max(1.0f, std::min(chebyOmega, 2.0f));
       for (uint32_t i = 0; i < bodies.size(); ++i) {
-        if (bodies[i].mass <= 0) continue;
-        bodies[i].position = chebyPrevPrevPos[i] +
-            (bodies[i].position - chebyPrevPrevPos[i]) * chebyOmega;
+        if (storage.bodies.mass[i] <= 0) continue;
+        storage.bodies.position[i] = chebyPrevPrevPos[i] +
+            (storage.bodies.position[i] - chebyPrevPrevPos[i]) * chebyOmega;
         Quat qPrev = chebyPrevPrevRot[i];
-        Quat qCur = bodies[i].rotation;
+        Quat qCur = storage.bodies.rotation[i];
         float dotQ = qPrev.w * qCur.w + qPrev.x * qCur.x +
                      qPrev.y * qCur.y + qPrev.z * qCur.z;
         if (dotQ < 0) qCur = qCur * (-1.0f);
@@ -938,7 +1045,8 @@ void Solver::stagePrimalSolve(float invDt, float dt2) {
                     qPrev.x + chebyOmega * (qCur.x - qPrev.x),
                     qPrev.y + chebyOmega * (qCur.y - qPrev.y),
                     qPrev.z + chebyOmega * (qCur.z - qPrev.z));
-        bodies[i].rotation = qBlend.normalized();
+        storage.bodies.rotation[i] = qBlend.normalized();
+        syncBodyStateToAoS(*this, i);
       }
     }
 
@@ -957,11 +1065,16 @@ void Solver::stageDualUpdate(float dt2) {
       auto &c = contacts[ci];
       computeConstraint(c);
       for (int i = 0; i < 3; i++) {
-        float oldLambda = c.lambda[i];
-        float rawLambda = c.penalty[i] * c.C[i] + oldLambda;
-        c.lambda[i] = std::max(c.fmin[i], std::min(c.fmax[i], rawLambda));
-        if (c.lambda[i] < c.fmax[i] && c.lambda[i] > c.fmin[i])
-          c.penalty[i] = std::min(c.penalty[i] + beta * fabsf(c.C[i]), PENALTY_MAX);
+        float oldLambda = storage.contacts.lambda[ci][i];
+        float rawLambda = storage.contacts.penalty[ci][i] * storage.contacts.C[ci][i] + oldLambda;
+        storage.contacts.lambda[ci][i] = std::max(storage.contacts.fmin[ci][i], std::min(storage.contacts.fmax[ci][i], rawLambda));
+        if (storage.contacts.lambda[ci][i] < storage.contacts.fmax[ci][i] &&
+            storage.contacts.lambda[ci][i] > storage.contacts.fmin[ci][i])
+          storage.contacts.penalty[ci][i] = std::min(storage.contacts.penalty[ci][i] +
+                                                         beta * fabsf(storage.contacts.C[ci][i]),
+                                                     PENALTY_MAX);
+        c.lambda[i] = storage.contacts.lambda[ci][i];
+        c.penalty[i] = storage.contacts.penalty[ci][i];
       }
     }
   });
@@ -1064,28 +1177,33 @@ void Solver::stageVelocityWriteback(float invDt) {
   tasks().parallelFor({0u, (uint32_t)bodies.size()}, [&](TaskRange range) {
     for (uint32_t bi = range.begin; bi < range.end; ++bi) {
       auto &body = bodies[bi];
-      if (body.mass <= 0)
+      if (storage.bodies.mass[bi] <= 0)
         continue;
-      body.prevLinearVelocity = body.linearVelocity;
-      body.linearVelocity = (body.position - body.initialPosition) * invDt;
-      Quat dq = body.rotation * body.initialRotation.conjugate();
+      body.prevLinearVelocity = storage.bodies.linearVelocity[bi];
+      storage.bodies.prevLinearVelocity[bi] = storage.bodies.linearVelocity[bi];
+      storage.bodies.linearVelocity[bi] =
+          (storage.bodies.position[bi] - storage.bodies.initialPosition[bi]) * invDt;
+      Quat dq = storage.bodies.rotation[bi] * storage.bodies.initialRotation[bi].conjugate();
       if (dq.w < 0)
         dq = -dq;
-      body.angularVelocity = Vec3(dq.x, dq.y, dq.z) * (2.0f * invDt);
-      if (body.linearDamping > 0.0f) {
-        float decay = std::max(0.0f, 1.0f - body.linearDamping * dt);
-        body.linearVelocity = body.linearVelocity * decay;
+      storage.bodies.angularVelocity[bi] = Vec3(dq.x, dq.y, dq.z) * (2.0f * invDt);
+      if (storage.bodies.linearDamping[bi] > 0.0f) {
+        float decay = std::max(0.0f, 1.0f - storage.bodies.linearDamping[bi] * dt);
+        storage.bodies.linearVelocity[bi] = storage.bodies.linearVelocity[bi] * decay;
       }
-      if (body.angularDamping > 0.0f) {
-        float decay = std::max(0.0f, 1.0f - body.angularDamping * dt);
-        body.angularVelocity = body.angularVelocity * decay;
+      if (storage.bodies.angularDamping[bi] > 0.0f) {
+        float decay = std::max(0.0f, 1.0f - storage.bodies.angularDamping[bi] * dt);
+        storage.bodies.angularVelocity[bi] = storage.bodies.angularVelocity[bi] * decay;
       }
-      float linSpeed = body.linearVelocity.length();
-      if (linSpeed > body.maxLinearVelocity)
-        body.linearVelocity = body.linearVelocity * (body.maxLinearVelocity / linSpeed);
-      float angSpeed = body.angularVelocity.length();
-      if (angSpeed > body.maxAngularVelocity)
-        body.angularVelocity = body.angularVelocity * (body.maxAngularVelocity / angSpeed);
+      float linSpeed = storage.bodies.linearVelocity[bi].length();
+      if (linSpeed > storage.bodies.maxLinearVelocity[bi])
+        storage.bodies.linearVelocity[bi] = storage.bodies.linearVelocity[bi] *
+                                            (storage.bodies.maxLinearVelocity[bi] / linSpeed);
+      float angSpeed = storage.bodies.angularVelocity[bi].length();
+      if (angSpeed > storage.bodies.maxAngularVelocity[bi])
+        storage.bodies.angularVelocity[bi] = storage.bodies.angularVelocity[bi] *
+                                             (storage.bodies.maxAngularVelocity[bi] / angSpeed);
+      syncBodyStateToAoS(*this, bi);
     }
   });
 }
@@ -1094,6 +1212,7 @@ void Solver::step(float dt_) {
   dt = dt_;
   float invDt = 1.0f / dt;
   float dt2 = dt * dt;
+  storage.buildFromScene(bodies, contacts, d6Joints, gearJoints, articulations);
   warmstart();
   stagePredictionAndInertia(invDt, dt2);
   stageBuildAdjacency();
@@ -1105,7 +1224,9 @@ void Solver::step(float dt_) {
   stageBuildSweepOrders();
   stagePrimalSolve(invDt, dt2);
   applyPostSolveMotors(invDt, dt2);
+  storage.bodies.buildFromBodies(bodies);
   stageVelocityWriteback(invDt);
+  storage.scatterToScene(bodies, contacts);
 }
 
 } // namespace AvbdRef

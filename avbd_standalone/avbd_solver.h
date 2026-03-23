@@ -1,6 +1,7 @@
 #pragma once
 #include "avbd_articulation.h"
 #include "avbd_contact_prep.h"
+#include "avbd_soa_storage.h"
 #include "avbd_types.h"
 #include <functional>
 #include <vector>
@@ -93,6 +94,7 @@ struct Solver {
   TaskSystem *taskSystem = nullptr;
   InlineTaskSystem inlineTaskSystem;
   PipelineBuffers pipeline;
+  SoA::SolverStorage storage;
 
   // Joint creation (all return index into d6Joints)
   uint32_t addSphericalJoint(uint32_t bodyA, uint32_t bodyB,
