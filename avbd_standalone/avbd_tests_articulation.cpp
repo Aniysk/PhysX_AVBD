@@ -1,13 +1,78 @@
 #include "avbd_articulation.h"
+#include "avbd_benchmarks.h"
 #include "avbd_collision.h"
 #include "avbd_test_utils.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace AvbdRef;
+
+namespace {
+struct BenchmarkTaskSystem final : TaskSystem {
+  uint32_t workerCount;
+  explicit BenchmarkTaskSystem(uint32_t count) : workerCount(count ? count : 1u) {}
+  void parallelFor(TaskRange range, const std::function<void(TaskRange)> &fn) override {
+    const uint32_t count = range.end > range.begin ? (range.end - range.begin) : 0u;
+    if (workerCount <= 1 || count <= 1) { fn(range); return; }
+    std::vector<std::thread> threads;
+    const uint32_t chunks = std::min(workerCount, count);
+    for (uint32_t i = 0; i < chunks; ++i) {
+      const uint32_t begin = range.begin + (count * i) / chunks;
+      const uint32_t end = range.begin + (count * (i + 1)) / chunks;
+      threads.emplace_back([=, &fn]() { if (begin < end) fn({begin, end}); });
+    }
+    for (auto &t : threads) t.join();
+  }
+};
+
+template <typename SetupFn, typename PreStepFn>
+AvbdBenchmarkRecord runArticScenario(const char *name, SetupFn setupFn,
+                                     PreStepFn preStepFn, uint32_t workers) {
+  Solver solver;
+  solver.gravity = {0, -9.81f, 0};
+  solver.dt = 1.0f / 60.0f;
+  solver.iterations = 28;
+  BenchmarkTaskSystem taskSystem(workers);
+  if (workers > 1) solver.setTaskSystem(&taskSystem);
+  ContactCache cache;
+  setupFn(solver);
+  for (uint32_t i = 0; i < 60; ++i) {
+    solver.contacts.clear();
+    preStepFn(solver, i, cache);
+    solver.step(solver.dt);
+    cache.save(solver);
+  }
+  AvbdBenchmarkRecord r;
+  r.name = name; r.family = "articulation"; r.execution = workers > 1 ? "task-system" : "single-thread";
+  for (uint32_t i = 0; i < 180; ++i) {
+    solver.contacts.clear();
+    preStepFn(solver, i, cache);
+    auto t0 = std::chrono::steady_clock::now();
+    solver.step(solver.dt);
+    r.msPerFrame += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    cache.save(solver);
+    const auto &s = solver.lastStepStats;
+    r.stageBuildIslandsMs += s.stageBuildIslandsMs;
+    r.stagePrimalSolveMs += s.stagePrimalSolveMs;
+    r.stageDualUpdateMs += s.stageDualUpdateMs;
+    r.writebackMs += s.writebackMs;
+    r.aosToSoABuildMs += s.aosToSoABuildMs;
+    r.soaScatterMs += s.soaScatterMs;
+    r.constraintCount += s.constraintCount;
+    r.iterationCount += s.primalIterations;
+  }
+  const double inv = 1.0 / 180.0;
+  r.msPerFrame *= inv; r.stageBuildIslandsMs *= inv; r.stagePrimalSolveMs *= inv;
+  r.stageDualUpdateMs *= inv; r.writebackMs *= inv; r.aosToSoABuildMs *= inv; r.soaScatterMs *= inv;
+  r.constraintCount = uint32_t(r.constraintCount * inv); r.iterationCount = uint32_t(r.iterationCount * inv);
+  return r;
+}
+} // namespace
 
 extern int gTestsPassed;
 extern int gTestsFailed;
@@ -27,6 +92,45 @@ extern int gTestsFailed;
     gTestsPassed++;                                                            \
     return true;                                                               \
   } while (0)
+
+void registerArticulationBenchmarks(std::vector<AvbdBenchmarkRecord> &out) {
+  auto articulationChainSetup = [](Solver &solver) {
+    const int N = 24;
+    Articulation artic;
+    artic.fixedBase = true;
+    artic.fixedBasePos = Vec3(0, 30, 0);
+    int parent = -1;
+    for (int i = 0; i < N; ++i) {
+      uint32_t body = solver.addBody({0, 29.0f - i * 1.2f, 0}, Quat(), {0.15f, 0.5f, 0.15f}, 500.0f);
+      parent = artic.addLink(body, parent, eARTIC_REVOLUTE, Vec3(0, 0, 1),
+                             parent < 0 ? Vec3(0, 0, 0) : Vec3(0, -0.6f, 0),
+                             Vec3(0, 0.6f, 0), solver.bodies);
+    }
+    solver.articulations.push_back(artic);
+  };
+  auto emptyPre = [](Solver &, uint32_t, ContactCache &) {};
+  out.push_back(runArticScenario("articulation chains", articulationChainSetup, emptyPre, 1));
+  out.push_back(runArticScenario("articulation chains", articulationChainSetup, emptyPre, 4));
+
+  auto scissorSetup = [](Solver &solver) {
+    solver.iterations = 32;
+    for (int i = 0; i < 8; ++i) {
+      uint32_t a = solver.addBody({-2.0f + i * 0.8f, 8.0f + i * 0.3f, 0}, Quat(), {0.8f, 0.15f, 0.15f}, 50.0f);
+      uint32_t b = solver.addBody({2.0f - i * 0.8f, 8.0f + i * 0.3f, 0}, Quat(), {0.8f, 0.15f, 0.15f}, 50.0f);
+      solver.addRevoluteJoint(a, b, {0, 0, 0}, {0, 0, 0}, {0, 0, 1});
+      if (i > 0) {
+        solver.addSphericalJoint(a - 2, a, {0.8f, 0, 0}, {-0.8f, 0, 0});
+        solver.addSphericalJoint(b - 2, b, {-0.8f, 0, 0}, {0.8f, 0, 0});
+      }
+    }
+  };
+  auto scissorPre = [](Solver &solver, uint32_t, ContactCache &cache) {
+    collideAll(solver, 0.05f);
+    cache.restore(solver);
+  };
+  out.push_back(runArticScenario("scissor-lift closed loops", scissorSetup, scissorPre, 1));
+  out.push_back(runArticScenario("scissor-lift closed loops", scissorSetup, scissorPre, 4));
+}
 
 // =============================================================================
 // test74: Single revolute pendulum — gravity swing + constraint correctness

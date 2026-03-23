@@ -3,6 +3,7 @@
 #include "avbd_contact_prep.h"
 #include "avbd_soa_storage.h"
 #include "avbd_types.h"
+#include <cstdint>
 #include <functional>
 #include <vector>
 
@@ -31,6 +32,23 @@ struct InlineTaskSystem final : TaskSystem {
 };
 
 struct Solver {
+  struct StepStats {
+    double aosToSoABuildMs = 0.0;
+    double stageBuildIslandsMs = 0.0;
+    double stagePrimalSolveMs = 0.0;
+    double stageDualUpdateMs = 0.0;
+    double writebackMs = 0.0;
+    double soaScatterMs = 0.0;
+    uint32_t bodyCount = 0;
+    uint32_t contactCount = 0;
+    uint32_t d6JointCount = 0;
+    uint32_t gearJointCount = 0;
+    uint32_t articulationCount = 0;
+    uint32_t islandCount = 0;
+    uint32_t constraintCount = 0;
+    uint32_t primalIterations = 0;
+  };
+
   Vec3 gravity = {0, -9.8f, 0};
   int iterations = 10;
   float alpha = 0.95f;              // stabilization
@@ -95,6 +113,7 @@ struct Solver {
   InlineTaskSystem inlineTaskSystem;
   PipelineBuffers pipeline;
   SoA::SolverStorage storage;
+  StepStats lastStepStats;
 
   // Joint creation (all return index into d6Joints)
   uint32_t addSphericalJoint(uint32_t bodyA, uint32_t bodyB,
