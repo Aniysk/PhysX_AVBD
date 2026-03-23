@@ -1,34 +1,18 @@
 #pragma once
 #include "avbd_articulation.h"
 #include "avbd_contact_prep.h"
+#include "avbd_executor.h"
+#include "avbd_profiler.h"
+#include "avbd_runtime.h"
+#include "avbd_sleep.h"
 #include "avbd_soa_storage.h"
 #include "avbd_types.h"
-#include <functional>
 #include <vector>
 
 namespace AvbdRef {
 
 static constexpr float PENALTY_MIN = 1000.0f;
 static constexpr float PENALTY_MAX = 1e9f;
-
-struct TaskRange {
-  uint32_t begin = 0;
-  uint32_t end = 0;
-};
-
-struct TaskSystem {
-  virtual ~TaskSystem() = default;
-  virtual void parallelFor(TaskRange range,
-                           const std::function<void(TaskRange)> &fn) = 0;
-  virtual void wait() {}
-};
-
-struct InlineTaskSystem final : TaskSystem {
-  void parallelFor(TaskRange range,
-                   const std::function<void(TaskRange)> &fn) override {
-    fn(range);
-  }
-};
 
 struct Solver {
   Vec3 gravity = {0, -9.8f, 0};
@@ -91,8 +75,9 @@ struct Solver {
     std::vector<std::vector<uint32_t>> sweepOrders;
   };
 
-  TaskSystem *taskSystem = nullptr;
-  InlineTaskSystem inlineTaskSystem;
+  Runtime runtime;
+  SleepSystem sleepSystem;
+  Profiler profiler;
   PipelineBuffers pipeline;
   SoA::SolverStorage storage;
 
@@ -117,8 +102,12 @@ struct Solver {
                              Vec3 localAnchorA, Vec3 localAnchorB,
                              Vec3 localAxisA, float rho = 1e6f);
 
-  void setTaskSystem(TaskSystem *tasks) { taskSystem = tasks; }
-  TaskSystem &tasks() { return taskSystem ? *taskSystem : inlineTaskSystem; }
+  void setTaskSystem(TaskSystem *tasks) { runtime.setExecutor(tasks); }
+  TaskSystem &tasks() { return runtime.executor(); }
+  RuntimeConfig &runtimeConfig() { return runtime.config(); }
+  const RuntimeConfig &runtimeConfig() const { return runtime.config(); }
+  RuntimeStatistics &runtimeStats() { return runtime.stats(); }
+  const RuntimeStatistics &runtimeStats() const { return runtime.stats(); }
 
   // Cone limit (spherical joints)
   void setSphericalJointConeLimit(uint32_t jointIdx, Vec3 coneAxisA,
