@@ -1,5 +1,5 @@
 #pragma once
-#include "avbd_solver.h"
+#include "avbd_collision_cache.h"
 #include <map>
 #include <vector>
 
@@ -63,62 +63,6 @@ inline void addBoxOnBoxContacts(Solver &solver, uint32_t topIdx,
     solver.addContact(topIdx, bottomIdx, normal, rA, rB, depth, fric);
   }
 }
-
-// =============================================================================
-// ContactCache -- warm-start lambda / penalty across frames
-// =============================================================================
-struct ContactCache {
-  struct Key {
-    uint32_t bodyA, bodyB;
-    int32_t rAx, rAy, rAz;
-    bool operator<(const Key &o) const {
-      if (bodyA != o.bodyA)
-        return bodyA < o.bodyA;
-      if (bodyB != o.bodyB)
-        return bodyB < o.bodyB;
-      if (rAx != o.rAx)
-        return rAx < o.rAx;
-      if (rAy != o.rAy)
-        return rAy < o.rAy;
-      return rAz < o.rAz;
-    }
-  };
-  struct Entry {
-    float lambda[3], penalty[3];
-  };
-  std::map<Key, Entry> data;
-
-  static Key makeKey(const Contact &c) {
-    return {c.bodyA, c.bodyB,
-            (int32_t)(c.rA.x * 1000.0f + (c.rA.x >= 0 ? 0.5f : -0.5f)),
-            (int32_t)(c.rA.y * 1000.0f + (c.rA.y >= 0 ? 0.5f : -0.5f)),
-            (int32_t)(c.rA.z * 1000.0f + (c.rA.z >= 0 ? 0.5f : -0.5f))};
-  }
-
-  void save(const Solver &solver) {
-    data.clear();
-    for (const auto &c : solver.contacts) {
-      Entry e;
-      for (int i = 0; i < 3; i++) {
-        e.lambda[i] = c.lambda[i];
-        e.penalty[i] = c.penalty[i];
-      }
-      data[makeKey(c)] = e;
-    }
-  }
-
-  void restore(Solver &solver) {
-    for (auto &c : solver.contacts) {
-      auto it = data.find(makeKey(c));
-      if (it != data.end()) {
-        for (int i = 0; i < 3; i++) {
-          c.lambda[i] = it->second.lambda[i];
-          c.penalty[i] = it->second.penalty[i];
-        }
-      }
-    }
-  }
-};
 
 // =============================================================================
 // Dynamic contact generation (with proximity check)
