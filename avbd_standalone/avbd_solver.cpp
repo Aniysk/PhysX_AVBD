@@ -2,6 +2,7 @@
 #include "avbd_articulation.h"
 #include "avbd_d6_core.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -1002,7 +1003,10 @@ void Solver::stagePrimalSolve(float invDt, float dt2) {
       }
     }
 
+    auto dualStart = std::chrono::steady_clock::now();
     stageDualUpdate(dt2);
+    lastStepStats.stageDualUpdateMs +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dualStart).count();
 
     if (useAndersonAccel) {
       std::vector<float> postState;
@@ -1271,20 +1275,27 @@ void Solver::step(float dt_) {
   runtime.stats().totalIterations = (uint32_t)iterations;
   sleepSystem.beginStep(bodies);
   storage.buildFromScene(bodies, contacts, d6Joints, gearJoints, articulations);
+  lastStepStats.aosToSoABuildMs = msSince(t0);
   warmstart();
   stagePredictionAndInertia(invDt, dt2);
   stageBuildAdjacency();
   stagePropagateMass(dt2);
   stageComputeContactC0();
+  t0 = Clock::now();
   stageBuildIslands();
   runtime.stats().numIslands = (uint32_t)pipeline.islands.size();
   stageBuildContactBatches();
   stageBuildConstraintGraphs();
   stageBuildSweepOrders();
+  t0 = Clock::now();
   stagePrimalSolve(invDt, dt2);
+  lastStepStats.stagePrimalSolveMs = msSince(t0);
   applyPostSolveMotors(invDt, dt2);
   storage.bodies.buildFromBodies(bodies);
+  t0 = Clock::now();
   stageVelocityWriteback(invDt);
+  lastStepStats.writebackMs = msSince(t0);
+  t0 = Clock::now();
   storage.scatterToScene(bodies, contacts);
   if (runtimeConfig().hasExecutionFlag(ExecutionFlags::eENABLE_SLEEPING))
     sleepSystem.endStep(bodies, dt, runtimeConfig());
