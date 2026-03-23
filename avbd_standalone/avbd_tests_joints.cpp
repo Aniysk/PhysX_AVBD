@@ -1,11 +1,79 @@
 #include "avbd_collision.h"
+#include "avbd_benchmarks.h"
 #include "avbd_test_utils.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <thread>
 #include <vector>
 
 using namespace AvbdRef;
+
+namespace {
+struct BenchmarkTaskSystem final : TaskSystem {
+  uint32_t workerCount;
+  explicit BenchmarkTaskSystem(uint32_t count) : workerCount(count ? count : 1u) {}
+  void parallelFor(TaskRange range, const std::function<void(TaskRange)> &fn) override {
+    const uint32_t count = range.end > range.begin ? (range.end - range.begin) : 0u;
+    if (workerCount <= 1 || count <= 1) {
+      fn(range);
+      return;
+    }
+    const uint32_t chunks = std::min(workerCount, count);
+    std::vector<std::thread> threads;
+    for (uint32_t i = 0; i < chunks; ++i) {
+      const uint32_t begin = range.begin + (count * i) / chunks;
+      const uint32_t end = range.begin + (count * (i + 1)) / chunks;
+      threads.emplace_back([=, &fn]() { if (begin < end) fn({begin, end}); });
+    }
+    for (auto &t : threads) t.join();
+  }
+};
+
+template <typename SetupFn, typename PreStepFn>
+AvbdBenchmarkRecord runJointScenario(const char *name, SetupFn setupFn,
+                                     PreStepFn preStepFn, uint32_t workers) {
+  Solver solver;
+  solver.gravity = {0, -9.81f, 0};
+  solver.dt = 1.0f / 60.0f;
+  solver.iterations = 24;
+  BenchmarkTaskSystem taskSystem(workers);
+  if (workers > 1) solver.setTaskSystem(&taskSystem);
+  ContactCache cache;
+  setupFn(solver);
+  for (uint32_t i = 0; i < 60; ++i) {
+    solver.contacts.clear();
+    preStepFn(solver, i, cache);
+    solver.step(solver.dt);
+    cache.save(solver);
+  }
+  AvbdBenchmarkRecord r;
+  r.name = name; r.family = "joints"; r.execution = workers > 1 ? "task-system" : "single-thread";
+  for (uint32_t i = 0; i < 180; ++i) {
+    solver.contacts.clear();
+    preStepFn(solver, i, cache);
+    auto t0 = std::chrono::steady_clock::now();
+    solver.step(solver.dt);
+    r.msPerFrame += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    cache.save(solver);
+    const auto &s = solver.lastStepStats;
+    r.stageBuildIslandsMs += s.stageBuildIslandsMs;
+    r.stagePrimalSolveMs += s.stagePrimalSolveMs;
+    r.stageDualUpdateMs += s.stageDualUpdateMs;
+    r.writebackMs += s.writebackMs;
+    r.aosToSoABuildMs += s.aosToSoABuildMs;
+    r.soaScatterMs += s.soaScatterMs;
+    r.constraintCount += s.constraintCount;
+    r.iterationCount += s.primalIterations;
+  }
+  const double inv = 1.0 / 180.0;
+  r.msPerFrame *= inv; r.stageBuildIslandsMs *= inv; r.stagePrimalSolveMs *= inv;
+  r.stageDualUpdateMs *= inv; r.writebackMs *= inv; r.aosToSoABuildMs *= inv; r.soaScatterMs *= inv;
+  r.constraintCount = uint32_t(r.constraintCount * inv); r.iterationCount = uint32_t(r.iterationCount * inv);
+  return r;
+}
+} // namespace
 
 extern int gTestsPassed;
 extern int gTestsFailed;
@@ -25,6 +93,34 @@ extern int gTestsFailed;
     gTestsPassed++;                                                            \
     return true;                                                               \
   } while (0)
+
+void registerJointBenchmarks(std::vector<AvbdBenchmarkRecord> &out) {
+  auto chainmailSetup = [](Solver &solver) {
+    solver.iterations = 24;
+    const int NX = 12, NY = 12;
+    const float spacing = 1.4f;
+    uint32_t grid[NY][NX];
+    for (int row = 0; row < NY; ++row)
+      for (int col = 0; col < NX; ++col)
+        grid[row][col] = solver.addBody({col * spacing, 28.0f - row * spacing, 0},
+                                        Quat(), {0.25f, 0.25f, 0.25f}, 2.0f, 0.4f);
+    for (int col = 0; col < NX; ++col)
+      solver.addSphericalJoint(UINT32_MAX, grid[0][col], {col * spacing, 28.0f, 0}, {0, 0, 0});
+    for (int row = 0; row < NY; ++row)
+      for (int col = 0; col + 1 < NX; ++col)
+        solver.addSphericalJoint(grid[row][col], grid[row][col + 1], {spacing * 0.5f, 0, 0}, {-spacing * 0.5f, 0, 0});
+    for (int row = 0; row + 1 < NY; ++row)
+      for (int col = 0; col < NX; ++col)
+        solver.addSphericalJoint(grid[row][col], grid[row + 1][col], {0, -spacing * 0.5f, 0}, {0, spacing * 0.5f, 0});
+    solver.addBody({(NX * spacing) * 0.5f, 20.0f, 0.0f}, Quat(), {1.5f, 1.5f, 1.5f}, 30.0f, 0.4f);
+  };
+  auto chainmailPre = [](Solver &solver, uint32_t, ContactCache &cache) {
+    collideAll(solver, 0.05f);
+    cache.restore(solver);
+  };
+  out.push_back(runJointScenario("chainmail/joint meshes", chainmailSetup, chainmailPre, 1));
+  out.push_back(runJointScenario("chainmail/joint meshes", chainmailSetup, chainmailPre, 4));
+}
 
 // Helper for Test 24/25/26
 static int collideFiltered(Solver &solver, uint32_t ballIdx, uint32_t nodeStart,

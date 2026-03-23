@@ -2,6 +2,7 @@
 #include "avbd_articulation.h"
 #include "avbd_d6_core.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -951,7 +952,10 @@ void Solver::stagePrimalSolve(float invDt, float dt2) {
       }
     }
 
+    auto dualStart = std::chrono::steady_clock::now();
     stageDualUpdate(dt2);
+    lastStepStats.stageDualUpdateMs +=
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dualStart).count();
 
     if (useAndersonAccel) {
       std::vector<float> postState;
@@ -1209,24 +1213,54 @@ void Solver::stageVelocityWriteback(float invDt) {
 }
 
 void Solver::step(float dt_) {
+  using Clock = std::chrono::steady_clock;
+  auto msSince = [](const Clock::time_point &start) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  };
   dt = dt_;
   float invDt = 1.0f / dt;
   float dt2 = dt * dt;
+  lastStepStats = StepStats{};
+  lastStepStats.bodyCount = (uint32_t)bodies.size();
+  lastStepStats.contactCount = (uint32_t)contacts.size();
+  lastStepStats.d6JointCount = (uint32_t)d6Joints.size();
+  lastStepStats.gearJointCount = (uint32_t)gearJoints.size();
+  lastStepStats.articulationCount = (uint32_t)articulations.size();
+  lastStepStats.constraintCount = lastStepStats.contactCount +
+                                  lastStepStats.d6JointCount +
+                                  lastStepStats.gearJointCount;
+  for (const auto &artic : articulations)
+    lastStepStats.constraintCount += (uint32_t)artic.joints.size() +
+                                     (uint32_t)artic.mimicJoints.size() +
+                                     (uint32_t)artic.ikTargets.size();
+  lastStepStats.primalIterations = (uint32_t)std::max(iterations, 0);
+
+  auto t0 = Clock::now();
   storage.buildFromScene(bodies, contacts, d6Joints, gearJoints, articulations);
+  lastStepStats.aosToSoABuildMs = msSince(t0);
   warmstart();
   stagePredictionAndInertia(invDt, dt2);
   stageBuildAdjacency();
   stagePropagateMass(dt2);
   stageComputeContactC0();
+  t0 = Clock::now();
   stageBuildIslands();
+  lastStepStats.stageBuildIslandsMs = msSince(t0);
+  lastStepStats.islandCount = (uint32_t)pipeline.islands.size();
   stageBuildContactBatches();
   stageBuildConstraintGraphs();
   stageBuildSweepOrders();
+  t0 = Clock::now();
   stagePrimalSolve(invDt, dt2);
+  lastStepStats.stagePrimalSolveMs = msSince(t0);
   applyPostSolveMotors(invDt, dt2);
   storage.bodies.buildFromBodies(bodies);
+  t0 = Clock::now();
   stageVelocityWriteback(invDt);
+  lastStepStats.writebackMs = msSince(t0);
+  t0 = Clock::now();
   storage.scatterToScene(bodies, contacts);
+  lastStepStats.soaScatterMs = msSince(t0);
 }
 
 } // namespace AvbdRef

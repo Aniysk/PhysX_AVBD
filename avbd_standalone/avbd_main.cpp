@@ -1,3 +1,4 @@
+#include "avbd_benchmarks.h"
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -123,7 +124,9 @@ bool test103_scissorLiftValidation();
 int gTestsPassed = 0;
 int gTestsFailed = 0;
 
-int main() {
+int main(int argc, const char* const* argv) {
+  if (runStandaloneBenchmarks(argc, argv))
+    return 0;
   printf("=========================================\n");
   printf("Running AVBD Refactored Tests (48 Cases)\n");
   printf("=========================================\n");
